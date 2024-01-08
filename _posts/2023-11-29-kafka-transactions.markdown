@@ -15,15 +15,17 @@ broadly described in the [Kafka Transactions proposal](https://cwiki.apache.org/
 but for the sake of this post lets come up with an example similar to transactions in SQL databases.
 
 # Problem statement
-Let's say we have an online shop app, with three Kafka topics: `purchases`, `stock`, `parcels`. Whenever the customer buys
+Let's say we have an online shop app, with three Kafka topics: `purchase`, `invoices`, `shipments`. Whenever the customer buys
 a product, the `purchase` event is produced. It is then processed and two other events are produced:
-`stock` and `parcel`. The former indicates difference in stock for a product after purchase, the latter notifies the courier 
-that it has a new package to pick up.  
+`shipment` and `invoice`.
 
 ![three-topics.png](/img/transactions/three-topics.png)
 
-Obviously we don't want the situation where we send a parcel but don't decrease the product stock. We don't want the parcel
-to be sent twice too. The `stock` and `parcel` events should be published together (as a unit) or none of them.
+Obviously we don't want the situation where we make a shipment without processing invoice. We don't want the product
+to be sent twice too. The `purchase` and `invoice` events should be published together (as a unit) or none of them.
+
+# Idempotent producer
+
 
 # Transactions usage from client perspective
 Before we dig dive into internals of transactions let's use them in practice. 
