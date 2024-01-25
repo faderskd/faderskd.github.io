@@ -101,12 +101,11 @@ What if the broker saved the message, but some transient network issue caused no
 the message but will use the same sequence number. As we said previously the broker remembers which sequence numbers was sent, so it
 knows what to expect next. If the first try saved a message, the broker expects higher sequence number, and rejects lower sequences.
 From the producer perspective the request failed, so it uses the same sequence, but from the broker it was successful, and it increases the
-next expected sequence for this particular (PID, topic, partition). The idempotence mechanism work properly here.
+next expected sequence for this particular (PID, topic, partition). The idempotence mechanism is sufficient here.
 2. `Producer restart` - our application publishing messages may restart or crash at any time. What if the producer sent the message,
-it was persisted by the broker and just before receiving the response the application was restarted ? The new producer will be 
-created, it will send `InitPidRequest` and gets new PID. In our example app we commit offset after successful publish, 
-we didn't do that before the restart. We reprocess last message, send it with a completely new PID and sequence and we have duplicate. 
-The idempotence does not work here. 
+it was persisted by the broker and just before receiving the response the application was restarted ? The newly created producer 
+sends `InitPidRequest` and gets new PID. In our example app we commit offset after successful publish, we didn't do that before the restart. 
+We reprocess last message, send it with a completely new PID and sequence and we have duplicate. This time the idempotence is not enough.  
 3. `Broker restart` - another scenario is when we publish message to Kafka, it is persisted in broker, but the broker restarted/failed just 
 before the response was sent back to the producer. Let's see what producer configuration is needed to enable idempotence.
 
@@ -126,7 +125,7 @@ replicated (because of `ACK all`).
 
 // TODO: add info about markers
 ```shell
-Dumping /tmp/kraft-combined-logs/shipments-0/00000000000000000000.log
+Dumping /tmp/kraft-combined-logs/invoices-0/00000000000000000000.log
 Log starting offset: 0
 baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 6004 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1705529669807 size: 227 magic: 2 compresscodec: none crc: 3294951759 isvalid: true
 
@@ -230,7 +229,7 @@ props.setProperty("enable.idempotence", "true");
 props.setProperty("transactional.id", "myUniqueTransactionalId");
 ```
 
-The `transactional.id` is a unique identifier for a producer, and it has to be the same between producer restarts. 
+The `transactional.id` is a unique identifier provided by us for a producer, and it has to be the same between producer restarts. 
 Otherwise, we don't get transactional guarantees. Ok, but what it means to be the same ? 
 In an environment where we have multiple producer instances,
 every transactional id must map to a consistent set of input topic partitions. In our case:
@@ -245,14 +244,16 @@ every transactional id must map to a consistent set of input topic partitions. I
 The `transaction coordinator` - is just a usual broker. Every broker can be coordinator. The coordinator manages transactions for specific producer. 
 Just like the SQL databases keeps the WAL (write ahead log) of the transaction's operations, Kafka has transaction log too. It is an internal Kafka 
 topic (`__transaction_state`). This topic is divided into 50 partitions. This number suggests that if you have less than or equal to 
-50 brokers in a cluster, every broker has its own set of partitions. If you have more (wow!), increase the number of transaction log partitions.
-#### Initialization
+50 brokers in a cluster, every broker has its own set of partitions. If you have more (wow!), increase the number of transaction log partitions. 
+Transaction log is replicated to the follower replicas for availability in case of coordinator failure. 
 
-![transactions-initialization](/img/transactions/transaction-initialization.png)
+#### Initialization
 
 ```java
 producer.initTransactions();
 ```
+
+![transactions-initialization](/img/transactions/transaction-initialization.png)
 
 The first thing to do by a producer is to find its transaction coordinator. That's why it sends `FindCoordinatorRequest`(1) to any broker. 
 The broker then finds transaction coordinator and returns it to the producer (2). The algorithm is quite simple. It takes the hash from 
@@ -264,11 +265,73 @@ var kafkaTransactionLogPartitionId = hash(transactional.id) % transactionStateTo
 var coordinatorId = leaderOf(kafkaTransactionLogPartitionId);
 ```
 
-When the producer knows its coordinator it can send a request for acquiring the PID (3). Just like in case of idempotent 
-producer, it prevents from duplicates across single session, but this is a building block for transactions across producer 
-restarts too. We will find it out later.
+When the producer knows its coordinator it can send `InitPidRequest` request for acquiring the PID (3). The response (4) contains 
+the PID and epoch number. Just like in case of idempotent producer the former prevents from duplicates across single session, 
+but the latter is used for distinguishing between multiple incorporates of the same producer. So let's assume we have the following scenario:
+1. Producer with `transactional.id` set to `A` sends `InitPidRequest` to the transaction coordinator and gets `PID=2, epoch=0`
+2. Some time passed and the producer hung for some reason, so it was considered dead. 
+3. The new instance of the producer with the same `transactional.id` (`A`) was spawned. 
+4. The new instance sends `InitPidRequest` but this time it gets `PID=2, epoch=1` from the coordinator.
+5. When the first instance wakes up and tries to start new transaction it is immediately fenced, because the sent epoch number is 
+`0` and the newest is `1` for that transactional id. 
 
 #### Producer and broker internal state
+
+![transactional-state.png](/img/transactions/transactional-state.png)
+
+1. Similarly to the idempotent producer, transactional `KafkaProducer` keeps the mapping from topics partitions to the sequence number. 
+Because it has to avoid duplicates even in case of restarts it needs to remember its `transactional.id` and epoch number
+increasing with each producer restart. The epoch is used to fencing zombie instances of the old producer with same transactional id.
+2. Transaction coordinator keeps mapping from `transactional.id` to the producer PID, epoch number, output topic partitions 
+involved in transaction, status and few other fields not included in the picture above. 
+
+#### Staring transaction
+
+```java
+producer.beginTransaction();
+```
+
+The producer makes a bunch of validation and changes its internal state indicating that the transaction is in-progress. 
+No external requests to brokers here. 
+
+#### Sending messages to brokers
+
+```java
+producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice))).get();
+producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment))).get();
+```
+
+![transactional-sending-messages.png](/img/transactions/transactions-sending-messages.png)
+
+Finally, the messages go to the broker, huh? Well, not quite. Before the producer sends messages to the brokers, it has to 
+record which topic partitions it's sending messages to. So it sends `AddPartitionsToTxnRequest`(1) to the coordinator. This information 
+will be needed when committing/aborting transaction. The `AddPartitionsToTxnRequest` is sent only once for each topic partition.
+The coordinator just has to know which brokers to inform about transaction ending process.
+The partitions are added to the coordinator's in-memory map and applied to the transaction log (and replicated).  
+Now, the producer can go further and send messages to the brokers (2). The brokers can reject duplicates because of `PID` included (idempotency). 
+They can also reject messages from zombie instances because the presence of `epoch`. If the epoch is lower than expected, 
+the message is rejected. The brokers recognize if a message is transactional. The messages have `isTransactional` attribute.  
+It will be important when returning the messages to the consumers with proper isolation level. We'll cover that later.
+
+#### Sending offsets to consumer coordinator
+
+```java
+producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+```
+
+#### Commit or abort
+
+```java
+producer.commitTransaction(); // or we can call producer.abortTransaction() too 
+```
+
+### Transactional consumer
+
+#### Usage from client perspective
+
+#### Index
+
+### Guarantees in failures scenarios
 
 
 [//]: # (```shell)
