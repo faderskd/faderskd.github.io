@@ -226,7 +226,7 @@ To enable transactional producer we need to turn on idempotency and add addition
 ```java
 props.setProperty("acks", "all");
 props.setProperty("enable.idempotence", "true");
-props.setProperty("transactional.id", "myUniqueTransactionalId");
+props.setProperty("transactional.id", "myProducer");
 ```
 
 The `transactional.id` is a unique identifier provided by us for a producer, and it has to be the same between producer restarts. 
@@ -301,7 +301,7 @@ producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(inv
 producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment))).get();
 ```
 
-![transactional-sending-messages.png](/img/transactions/transactions-sending-messages.png)
+![transactions-sending-messages.png](/img/transactions/transactions-sending-messages.png)
 
 Finally, the messages go to the broker, huh? Well, not quite. Before the producer sends messages to the brokers, it has to 
 record which topic partitions it's sending messages to. So it sends `AddPartitionsToTxnRequest`(1) to the coordinator. This information 
@@ -310,8 +310,11 @@ The coordinator just has to know which brokers to inform about transaction endin
 The partitions are added to the coordinator's in-memory map and applied to the transaction log (and replicated).  
 Now, the producer can go further and send messages to the brokers (2). The brokers can reject duplicates because of `PID` included (idempotency). 
 They can also reject messages from zombie instances because the presence of `epoch`. If the epoch is lower than expected, 
-the message is rejected. The brokers recognize if a message is transactional. The messages have `isTransactional` attribute.  
-It will be important when returning the messages to the consumers with proper isolation level. We'll cover that later.
+the message is rejected. The brokers recognize if a message is transactional. The messages have special `isTransactional` attribute.  
+It will be important when returning the messages to the consumers with proper isolation level. We'll cover that later. 
+**Caution**
+The actual `ProduceRequest` is way more complex than on the picture. I've included only part of the request for one partition, 
+containing data important from the transactions viewpoint. 
 
 #### Sending offsets to consumer coordinator
 
@@ -319,17 +322,81 @@ It will be important when returning the messages to the consumers with proper is
 producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
 ```
 
+The offset committing in a Kafka is a topic (non pun intended) for a completely new blog post. I assume the reader knows basics
+of consumer-groups and offset committing. If not, please read the following [article](https://docs.confluent.io/platform/current/clients/consumer.html).
+
+We've consumed message from the `purchases` topic and published `invoice/shipment` events to the target topics. 
+These are still not visible to the consumers. Now we want to move forward on the `purchases` topic and commit consumed 
+offset. This fact has to be recorded to the transaction log and being part of the transaction. Why ? Once again, to get 
+atomicity and avoids duplicates. What if we consumed the `purchase` event, produced atomically outgoing events to the target topics 
+and before committing the offset for `purchases` the app crashed ? After recovery, the app has to start from some point. 
+It is the last committed offset before crash. But this one is some before the last message consumed. The Kafka solves that problem
+by confining offset commit as a part of transaction: message consuming, producing and offset committing happens together or 
+none of them.
+
+![transactions-committing-offsets.png](/img/transactions/transactions-committing-offsets.png)
+
+When adding offsets to transaction the producer sends `AddOffsetsToTxnRequest` (1). It contains basic transactional fields which 
+we've previously mentioned, and one additional field - consumer `groupId`. Base on this, the transaction coordinator calculates
+`__consumer_offsets` topic partition for our of consumer group (the consumer group of the `purchases` topic consumer). 
+You already know the algorithm. It is similar to one used in finding transactional coordinator.
+```
+var kafkaConsumerOffsetsTopicPartitionId = hash(purchasesConsumerGroupId) % consumerOffetsTopicPartitionsCount;
+```
+As usual, it is added to the transaction coordinator state, and replicated via internal `__transaction_state` topic. 
+The calculated partitions will be then used when committing/aborting transaction. 
+
+We notified the transactional coordinator about offsets, now it's time to notify the consumer group coordinator. 
+Under the hood`KafkaProducer` sends another `TxnOffsetCommitRequest` (2) to our consumer's coordinator. How to find a consumer group 
+coordinator ? 
+
+```
+var kafkaConsumerOffsetsTopicPartitionId = hash(purchasesConsumerGroupId) % consumerOffetsTopicPartitionsCount;
+var coordinatorId = leaderOf(kafkaConsumerOffsetsTopicPartitionId);
+```
+
+The request contains information about consumed topics partitions' offsets. In our case obviously about `purchases` topic.
+// TODO check markers for __consumer_offsets topic
+
+Phew, quite a lot of work in a single function call. This is not the end. We still have a lot to cover.
+
 #### Commit or abort
 
 ```java
 producer.commitTransaction(); // or we can call producer.abortTransaction() too 
 ```
 
+The last step is ending transaction. As in databases world we can commit or abort. The commit materializes the transaction,  
+and consumers of the output topics can see its result. The abort makes all events in being part of the transaction invisible. 
+However, there is one requirement: you need to properly configure consumer. Before that, let's see what happens in the brokers. 
+
+![transactions-markers.png](/img/transactions/transactions-markers.png)
+
+The producer sends a `EndTxnRequest` (1) to the transaction coordinator. As usual, the request contains `transactionalId`, 
+`PID`, `epoch` and a marker `committed` indicating if to commit or abort. As usual the request contains some other fields, I've not covered 
+in this post. The coordinator starts two phase commit.
+In the first phase, it updates its internal state and writes the `PREPARE_COMMIT/PREPARE_ABORT` 
+messages to the transaction log. The massage is fully replicated and then the response is returned to the producer. At this point 
+we can be sure the transaction is committed/aborted no matter what. If the coordinator crashes it can be replaced by a replica 
+having the transaction log copy mirroring the current transaction coordinator state. 
+The second phase is writing `COMMIT/ABORT` transaction markers to the leaders of topics partitions included in the transaction itself (2, 2', 2''). 
+In our case they are `shipments`, `invoices` and `__consumer_offsets` topics. When the marker is appended to the partition, 
+the messages being part of the transaction can be returned to the consumers now. The consumers will handle the messages and markers 
+properly based on the configured isolation level.
+Note that this is the first time when the coordinator communicates with the leader brokers. Because the offsets topic is also 
+a part of the transaction it has to write marker to the consumer group coordinator of our consumer fetching from `purchases` topic. 
+We know how to find it because we recorded `__consumer_offets` partition in the transaction log when sending offsets to transaction. 
+Depending on the marker type, the consumer group coordinator will return proper offset. In case of the abort it returns offsets 
+before the transaction started, in case of commit it has to return offsets included in transaction itself. This way we don't 
+reprocess the same `purchases` events in case of committed transaction.
+
 ### Transactional consumer
 
 #### Usage from client perspective
 
-#### Index
+#### Broker's LSO and consumer index
+
+### Full transactional flow
 
 ### Guarantees in failures scenarios
 
