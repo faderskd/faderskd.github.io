@@ -156,33 +156,37 @@ map it to another event(s) and publish mapped value(s) to another topic(s) as a 
 The verbose version: 
 
 ```java
-@Override
 public void start() {
     try {
         producer.initTransactions();
         consumer.subscribe(Collections.singleton(PURCHASE_TOPIC));
         while (running) {
-            try {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
-                for (ConsumerRecord<String, String> record : records) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
+            for (ConsumerRecord<String, String> record : records) {
+                try {
                     Purchase purchase = mapper.readValue(record.value(), Purchase.class);
-                    Invoice invoice = new Invoice(purchase.userId(), purchase.productId(),
-                            purchase.quantity(), purchase.totalPrice());
-                    Shipment shipment = new Shipment(UUID.randomUUID().toString(), purchase.productId(),
-                            purchase.userFullName(), "SomeStreet 12/18, 00-006 Warsaw", purchase.quantity());
+                    String invoiceEvent = mapper.writeValueAsString(new Invoice(purchase.userId(), purchase.productId(),
+                            purchase.quantity(), purchase.totalPrice()));
+                    String shipmentEvent = mapper.writeValueAsString(new Shipment(UUID.randomUUID().toString(), purchase.productId(),
+                            purchase.userFullName(), "SomeStreet 12/18, 00-006 Warsaw", purchase.quantity()));
 
                     producer.beginTransaction();
-                    producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice))).get();
-                    producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment))).get();
+                    producer.send(new ProducerRecord<>(INVOICES_TOPIC, invoiceEvent)).get();
+                    producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, shipmentEvent)).get();
                     Map<TopicPartition, OffsetAndMetadata> offsets = Map.of(
                             new TopicPartition(record.topic(), record.partition()),
-                            new OffsetAndMetadata(record.offset()));
+                            new OffsetAndMetadata(record.offset() + 1));
                     producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
                     producer.commitTransaction();
                     logger.info("Successfully processed purchase event: {}", purchase);
+                } catch (JacksonException ex) {
+                    logger.error("Error parsing purchase message", ex);
+                } catch (Exception ex) {
+                    logger.error("Error while processing purchase", ex);
+                    producer.abortTransaction();
+                    resetToLastCommittedPosition(consumer);
+                    break;
                 }
-            } catch (Exception ex) {
-                logger.error("Error while processing purchase", ex);
             }
         }
     } finally {
@@ -215,10 +219,12 @@ it in a consistent manner. It works like this:
 4. Commit - now all 3 things (2 events and 1 offset move) are atomically saved to the Kafka, no partial results. If something wrong 
 goes here the transaction is aborted, and the consumers don't see aborted events.
 
+// TODO: add info that we can batch multiple tranactions into one but for simplicity we sequentially process records
+
 ### Transaction compontents
 Ok, we can go deeper in each part of the transaction. It's time for drawings. 
 
-![transactions-components](/img/transactions/transaction-components.png)
+![transactions-components](/img/transactions/transactions-components.png)
 
 #### Transactional producer
 To enable transactional producer we need to turn on idempotency and add additional parameter: `transactional.id`.
@@ -253,7 +259,7 @@ Transaction log is replicated to the follower replicas for availability in case 
 producer.initTransactions();
 ```
 
-![transactions-initialization](/img/transactions/transaction-initialization.png)
+![transactions-initialization](/img/transactions/transactions-initialization.png)
 
 The first thing to do by a producer is to find its transaction coordinator. That's why it sends `FindCoordinatorRequest`(1) to any broker. 
 The broker then finds transaction coordinator and returns it to the producer (2). The algorithm is quite simple. It takes the hash from 
@@ -392,9 +398,56 @@ reprocess the same `purchases` events in case of committed transaction.
 
 ### Transactional consumer
 
+We've already covered the producing side of exactly once delivery. As mentioned before, the consumer has its role in the 
+process too.
+
 #### Usage from client perspective
 
+```java
+consumerProps.setProperty("group.id", "myConsumerGroup");
+consumerProps.setProperty("enable.auto.commit", "false");
+consumerProps.setProperty("isolation.level", "read_committed");
+```
+As usual, we have to provide consumer group id. We disable the offset auto-committing because it is a part of the transaction 
+managed by transactional producer. The isolation level controls how to read messages written transactionally. From documentation: 
+"If set to `read_committed`, consumer.poll() will only return transactional messages which have been committed. If set to `read_uncommitted`, 
+consumer.poll() will return all messages, even transactional messages which have been aborted." The transaction markers are not 
+returned to the applications in either case. 
+The important thing is that even in `read_committed` mode there is no guarantee that a single consumer reads 
+all messages from single transaction. It consumes transactional committed messages only from the assigned partitions. Transaction 
+can span multiple partitions from multiple topics, part of them can be handled by different consumer instance (image below).
+
+![transactions-two-consumers.png](/img/transactions/transactions-two-consumers.png)
+
 #### Broker's LSO and consumer index
+
+The messages returned to the apps are always in their offset order. In `read_committed` mode, the consumer has to know upfront which 
+messages are aborted, so they are not exposed to the client. Take the following log as an example:
+
+![transactions-log-of-messages.png](/img/transactions/transactions-log-of-messages.png)
+
+While consuming messages in order, the consumer can't return messages with offsets 0 and 1. In case of abort, 
+it has to omit the offsets being part of aborted transaction. In other words, the consumer needs some aborted messages filter. 
+This is the purpose of aborted transaction index. Thanks to this structure, the consumers know where are the offsets of aborted messages, 
+so `read_committed` mode can filter them out. The index is build on the broker side, and returned to the consumer in the `FetchResponse` 
+together with ordinary messages data.
+
+![transactions-aborted-index.png](/img/transactions/transactions-aborted-index.png)
+
+The on-disk index structure:
+
+```
+root@kafka2:/tmp/kraft-combined-logs/invoices-0# /opt/kafka/bin/kafka-dump-log.sh --files 00000000000000000000.txnindex 
+Dumping 00000000000000000000.txnindex
+version: 0 producerId: 0 firstOffset: 0 lastOffset: 1 lastStableOffset: 2
+```
+
+While returning messages, the broker returns only resolved transactions to the `read_committed` consumer. This means that any 
+pending transactions (without COMMIT/ABORT markers) will not be visible by the consumers until they end. To maintain such an invariant, 
+the broker keeps LSO (last stable offset) in its memory. It indicates the offset below which all transactions have been resolved. 
+Without this, it would not be possible to build the transaction index, as pending transactions has no markers written yet.
+
+![transactions-lso.png](/img/transactions/transactions-lso.png)
 
 ### Full transactional flow
 
