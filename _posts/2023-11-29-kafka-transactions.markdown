@@ -45,6 +45,7 @@ public void start() {
                             purchase.quantity(), purchase.totalPrice());
                     Shipment shipment = new Shipment(UUID.randomUUID().toString(), purchase.productId(),
                             purchase.userFullName(), "SomeStreet 12/18, 00-006 Warsaw", purchase.quantity());
+                    // We are blocking, then commit for simplicity. We should commit asynchronously.
                     producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice))).get();
                     producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment))).get();
                     consumer.commitSync();
@@ -171,8 +172,8 @@ public void start() {
                             purchase.userFullName(), "SomeStreet 12/18, 00-006 Warsaw", purchase.quantity()));
 
                     producer.beginTransaction();
-                    producer.send(new ProducerRecord<>(INVOICES_TOPIC, invoiceEvent)).get();
-                    producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, shipmentEvent)).get();
+                    producer.send(new ProducerRecord<>(INVOICES_TOPIC, invoiceEvent));
+                    producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, shipmentEvent));
                     Map<TopicPartition, OffsetAndMetadata> offsets = Map.of(
                             new TopicPartition(record.topic(), record.partition()),
                             new OffsetAndMetadata(record.offset() + 1));
@@ -204,8 +205,8 @@ ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
 for (ConsumerRecord<String, String> record : records) {
     ...
     producer.beginTransaction();
-    producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice))).get();
-    producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment))).get();
+    producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice)));
+    producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment)));
     ...
     producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
     producer.commitTransaction(); // or we can call producer.abortTransaction() too 
@@ -303,8 +304,8 @@ No external requests to brokers here.
 #### Sending messages to brokers
 
 ```java
-producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice))).get();
-producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment))).get();
+producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(invoice)));
+producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment)));
 ```
 
 ![transactions-sending-messages.png](/img/transactions/transactions-sending-messages.png)
@@ -361,7 +362,8 @@ var kafkaConsumerOffsetsTopicPartitionId = hash(purchasesConsumerGroupId) % cons
 var coordinatorId = leaderOf(kafkaConsumerOffsetsTopicPartitionId);
 ```
 
-The request contains information about consumed topics partitions' offsets. In our case obviously about `purchases` topic.
+The request contains information about consumed topics partitions' offsets. In our case obviously about `purchases` topic. 
+The offset if appended to the `__consumer_offsets` topic, but it is not returned to the clients until the transaction commits. 
 // TODO check markers for __consumer_offsets topic
 
 Phew, quite a lot of work in a single function call. This is not the end. We still have a lot to cover.
@@ -386,9 +388,9 @@ messages to the transaction log. The massage is fully replicated and then the re
 we can be sure the transaction is committed/aborted no matter what. If the coordinator crashes it can be replaced by a replica 
 having the transaction log copy mirroring the current transaction coordinator state. 
 The second phase is writing `COMMIT/ABORT` transaction markers to the leaders of topics partitions included in the transaction itself (2, 2', 2''). 
-In our case they are `shipments`, `invoices` and `__consumer_offsets` topics. When the marker is appended to the partition, 
-the messages being part of the transaction can be returned to the consumers now. The consumers will handle the messages and markers 
-properly based on the configured isolation level.
+In our case they are `shipments`, `invoices` and `__consumer_offsets` topics. The markers are appended via the `WriteTxnMarkerRequest` request. 
+After that, the messages being part of the transaction can be returned to the consumers now. 
+The consumers will handle the messages and markers properly based on the configured isolation level.
 Note that this is the first time when the coordinator communicates with the leader brokers. Because the offsets topic is also 
 a part of the transaction it has to write marker to the consumer group coordinator of our consumer fetching from `purchases` topic. 
 We know how to find it because we recorded `__consumer_offets` partition in the transaction log when sending offsets to transaction. 
@@ -404,7 +406,7 @@ process too.
 #### Usage from client perspective
 
 ```java
-consumerProps.setProperty("group.id", "myConsumerGroup");
+consumerProps.setProperty("group.id", "purchasesConsumerGroupId");
 consumerProps.setProperty("enable.auto.commit", "false");
 consumerProps.setProperty("isolation.level", "read_committed");
 ```
@@ -451,8 +453,73 @@ Without this, it would not be possible to build the transaction index, as pendin
 
 ### Full transactional flow
 
+As we already know all the transaction stages it is convenient to have a full picture in one place.
+
+![transactions-full-picture.png](/img/transactions/transactions-full-picture.png)
+
+That's a lot of steps, let's cover them in detail. 
+
+1. `KafkaProducer.initTransactions()` is called. The producer is being part of `ClientProducingApp` application. 
+The `FindCoordinatorRequest()` is sent to any broker (Broker5) on the picture. The request contains `transactionalId` used 
+in calculating the transaction coordinator (Broker4).
+2. `KafkaProduer` sends `InitPidRequest` to the coordinator, in response it gets producer id `PID` with some additional fields 
+just like producer epoch. This data is used both for idempotency and transactions API. It is also stored in brokers' log. 
+3. `KafkaConsumer.poll()` is called. The consumer is being part of the same `ClientProducingApp` application. The app 
+performs some atomic consume-transform-produce loop. It consumes events from `purchases` topic and produces other events to 
+`invoices` and `shipments` topics as a single atomic unit. Obviously the app can be scaled itself, but for the sake of better 
+visibility we have only one instance. The app makes separated transaction for each record it gets from `purchases` topic. Again, multiple 
+records can be batched in a single transaction for high throughput, but I'd like to focus on simple, easier to grasp scenario.  
+4. `KafkaProducer.beginTransaction()` is called. No external requests, only internal producer state is changes. 
+5. `KafkaProducer.send()` method is called. Producer calculates target topic partition. It knows on which broker it is 
+situated based on the internal metadata taken previously from the brokers. If it is the first message to this specific topic 
+partition, the producer sends `AddPartitionsToTxnRequest()` to the transaction coordinator. The coordinator updates its 
+current transactions internal state, persist the information from request to the `__transaction_state` topic and waits for 
+replication to follower replicas. 
+6. As part of the same `KafkaProducer.send()` method from previous point, producer sends the `ProduceRequest` with messages 
+to the leaders of calculated topic partitions. In our case these are Broker2 for `invoices` and Broker3 for `shipments` topic. 
+The messages are not sent immediately with a `send` call because producer is doing batching and sends them asynchronously. 
+Nevertheless, they will be sent at some point. Besides the records itself, the request contain `PID`, epoch and some other fields. 
+It contains the `transactionalId` too, but only for authorization purposes. The `transactionalId` is not persisted in the 
+topic data (`invoices`/`shipments`) logs. 
+7. `KafkaProducer.sendOffsetsToTransaction()` is called. Producer sends `AddOffsetsToTxnRequest` to transaction coordinator with 
+a consumer group id as one of the fields. The coordinator calculates offset topic partition, updates its internal state and
+replicates the state via `__transaction_state` topic to the followers. 
+8. As part of the same `KafkaProducer.sendOffsetsToTransaction()` method from previous point, producer calculates the 
+`purchasesConsumerGroupId` consumer group coordinator. The consumer group is used by `ClientProducingApp`. 
+Producer then sends the `TxnOffsetCommitRequest` to the calculated coordinator. The request contains information about offsets 
+at `purchases` topic partitions for the consumer group. Consumer group coordinator appends offsets to its internal 
+`__consumer_offsets` topic but does not it offsets in-memory state yet. It can't return the new offsets to clients until the 
+transaction commits. 
+9. `KafkaProducer.commitTransaction()` or `KafkaProducer.abortTransaction()` is called. Producer sends `EndTxtRequest` to 
+the transaction coordinator. Coordinator starts two phase commit. Firstly it updates its internal state by changing it to the 
+`PREPARE_COMMIT`/`PREPARE_ABORT`. It persists the state to the log and waits for replication to the followers. 
+10. At the second phase, the coordinator sends `WriteTxnMarkerRequest`. It causes writing transaction `COMMIT/ABORT` markers 
+to the topic partitions included in transactions. These are partitions for `invoices`, `shipments` and `__consumer_offsets` topics. 
+In case of coordinator crash, the information about transaction status is recorded to the `__transaction_state` log, 
+so the new coordinator can start from the same point and continue ending transaction process. In case of `__consumer_offsets` topic, 
+the transaction coordinator takes consumer group id from its transaction state, calculates the consumer group coordinator and sends 
+append marker request. 
+11. When the previous point succeeds the transaction coordinator updates its internal transaction state to `COMPLETE_COMMIT`/`COMPLE_ABORT` 
+end the transaction is ended. 
+12. After successful writes of transaction markers (point 10) to target topics, the brokers can now return new messages 
+to the consumers. The brokers move their LSOs (last stable offset) so they include the new messages. 
+The client app is consuming from target topics with `read_committed` mode. The call to `KafkaConsumer.poll()` sends `FetchRequest`. 
+The response contains new records together with aborted transaction index. The consumer uses the index to filter out aborted 
+transactions.
+In case of `read_uncommitted` mode, the brokers return new messages to the consumers immediately after they are appended to the 
+broker's log via `KafkaProducer.send()` from point 5.
+
 ### Guarantees in failures scenarios
 
+Finally, as we know how everything works together we can discuss Kafka exactly one delivery guarantees. 
+
+1. `KafkaProducer.send()` failure
+2. `KafkaProducer` failure
+3. `KafkaConsumer` failure (the one being part of consume-transform-produce loop)
+4. `KafkaConsumer` failure (the one consuming from target topics)
+4. Transaction coordinator
+5. Broker failure
+6. Consumer group coordinator failure
 
 [//]: # (```shell)
 [//]: # (root@kafka2:/tmp/kraft-combined-logs/shipments-1# /opt/kafka/bin/kafka-dump-log.sh --files 00000000000000000000.log)
