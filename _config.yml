@@ -1,54 +1,63 @@
-# Welcome to Jekyll!
-#
-# This config file is meant for settings that affect your whole blog, values
-# which you are expected to set up once and rarely edit after that. If you find
-# yourself editing this file very often, consider using Jekyll's data files
-# feature for the data you need to update frequently.
-#
-# For technical reasons, this file is *NOT* reloaded automatically when you use
-# 'bundle exec jekyll serve'. If you change this file, please restart the server process.
-#
-# If you need help with YAML syntax, here are some quick references for you:
-# https://learn-the-web.algonquindesign.ca/topics/markdown-yaml-cheat-sheet/#yaml
-# https://learnxinyminutes.com/docs/yaml/
-#
-# Site settings
-# These are used to personalize your new site. If you look in the HTML files,
-# you will see them accessed via {{ site.title }}, {{ site.email }}, and so on.
-# You can create any custom variable you would like, and they will be accessible
-# in the templates via {{ site.myvariable }}.
-
-title: Kafka (b)log
-email: daniel.faderski@gmail.com
-description: >- # this means to ignore newlines until "baseurl:"
+# Configurations
+title:            Kafka (b)log
+longtitle:        Kafka (b)log
+author:           Daniel Fąderski
+email:            daniel.faderski@gmail.com
+description: >
   Kafka blog aiming to learn unknown parts of known topics.
-baseurl: "" # the subpath of your site, e.g. /blog
-url: "" # the base hostname & protocol for your site, e.g. http://example.com
-#twitter_username: jekyllrb
-github_username:  faderskd
 
-# Build settings
-theme: minima
+version:          1.0
+gitbook_version:  3.2.3
+
+url:              'https://faderskd.github.io'
+baseurl:          '/home'
+rss:              RSS
+
+# bootstrap: use the remote theme for the site itself
+remote_theme: sighingnow/jekyll-gitbook
+
+toc:
+  enabled: true
+  h_min: 1
+  h_max: 3
+
+# customize the link favicon in header, will be {{site.baseurl}}/{{site.favicon_path}}
+favicon_path:     /assets/gitbook/images/favicon.ico
+
+# markdown render engine.
+markdown:         kramdown
+kramdown:
+  auto_ids:               true
+  input:                  GFM
+  math_engine:            mathjax
+  smart_quotes:           lsquo,rsquo,ldquo,rdquo
+  toc_levels:             1..6
+
+syntax_highlighter_style: colorful
+
+markdown_ext:             markdown,mkdown,mkdn,mkd,md
+
+# Permalinks
+permalink:                /:categories/:year-:month-:day-:title:output_ext
+
+# Disqus comments
+# disqushandler:            sighingnow
+
+exclude:
+  - _drafts
+
+collections:
+  pages:
+    output: true
+    permalink: /:collection/:path/
+
+page_width: 800px
+
+destination:      ./_site
+incremental:      false
+regenerate:       true
+
 plugins:
   - jekyll-feed
-
-# Exclude from processing.
-# The following items will not be processed, by default.
-# Any item listed under the `exclude:` key here will be automatically added to
-# the internal "default list".
-#
-# Excluded items can be processed by explicitly listing the directories or
-# their entries' file path in the `include:` list.
-#
-# exclude:
-#   - .sass-cache/
-#   - .jekyll-cache/
-#   - gemfiles/
-#   - Gemfile
-#   - Gemfile.lock
-#   - node_modules/
-#   - vendor/bundle/
-#   - vendor/cache/
-#   - vendor/gems/
-#   - vendor/ruby/
-
+  - jekyll-readme-index
+  - jemoji

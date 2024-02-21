@@ -1,0 +1,494 @@
+---
+---
+
+.book-body {
+    overflow-y: scroll;
+}
+
+.book-body .book-header {
+    position: fixed;
+    width: 100%;
+}
+
+.book.with-summary .book-body .book-header {
+    position: fixed;
+    width: calc(100% - 300px);
+}
+
+.book-body .body-inner {
+    /* position: absolute; */
+    margin-top: 50px;
+    min-height: calc(100% - 50px);
+}
+
+@media (max-width: 1240px) {
+    .book-body .body-inner {
+        position: absolute;
+        margin-top: 50px;
+        min-height: calc(100% - 50px)
+    }
+}
+
+.book-body .body-inner .page-wrapper {
+    min-height: calc(100% - 46px);
+}
+
+.book-body .body-inner .page-wrapper .page-inner {
+    padding-bottom: 20px;
+}
+
+@media (max-width: 1240px) {
+    .book-body .body-inner .navigation {
+        max-width: calc(50% - 3px);
+        width: calc(50% - 3px);
+    }
+
+    .book.with-summary .book-body .book-header {
+        overflow-x: hidden;
+        overflow-y: hidden;
+    }
+}
+
+.book .book-body .book-header {
+    background: #ffffff;
+}
+
+.book.color-theme-1 .book-body .book-header {
+    background: #f3eacb;
+}
+
+.book.color-theme-2 .book-body .book-header {
+    background: #1c1f2b;
+}
+
+.page-inner {
+    max-width: {{ site.page_width | default: '800px' }};
+}
+
+.back-to-top {
+    right: calc((100% - 300px - min(100% - 300px, {{ site.page_width | default: '800px' }})) / 2 + 25px);
+}
+
+/* scrollbar */
+::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+}
+
+::-webkit-scrollbar-track-piece {
+    /* background-color: rgba(125, 125, 125, 0.2); */
+    -webkit-border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:vertical {
+    height: 5px;
+    background-color: rgba(7, 17, 27, .2);
+    -webkit-border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:horizontal {
+    width: 5px;
+    background-color: rgba(125, 125, 125, 0.2);
+    -webkit-border-radius: 6px;
+}
+
+/* Style for search page on mobile screens */
+
+#book-search-input-link {
+    padding: 6px;
+    background: 0 0;
+    background: inherit;
+    transition: top .5s ease;
+    border-bottom: 1px solid rgba(0,0,0,.07);
+    border-top: 1px solid rgba(0,0,0,.07);
+    margin-bottom: 10px;
+    margin-top: -1px;
+}
+
+#book-search-input-link a {
+    width: 100%;
+    background: 0 0;
+    border: 1px solid transparent;
+    box-shadow: none;
+    outline: 0;
+    line-height: 38px;
+    padding: 7px 7px;
+    color: #757575;
+}
+
+#book-search-input {
+    display: block;
+}
+#book-search-input-link {
+    display: none;
+}
+
+@media (max-width: 1240px) {
+    #book-search-input {
+        display: none;
+    }
+    #book-search-input-link {
+        display: block;
+    }
+}
+
+#book-search-input-inside {
+    padding: 6px;
+    background: 0 0;
+    transition: top .5s ease;
+    background: #fff;
+    border-bottom: 1px solid rgba(0,0,0,.07);
+    border-top: 1px solid rgba(0,0,0,.07);
+    margin-bottom: 10px;
+    margin-top: -1px;
+}
+
+#book-search-input-inside input {
+    width: 100%;
+    background: 0 0;
+    border: 1px solid transparent;
+    box-shadow: none;
+    outline: 0;
+    line-height: 22px;
+    padding: 7px 7px;
+    color: inherit;
+}
+
+
+/* Custom font settings */
+
+.book.font-family-0 {
+    font-family: Georgia, serif;
+}
+.book.font-family-1 {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+/* Render wide tables */
+
+.table-wrapper {
+    overflow-x: scroll;
+}
+
+/* Tips, warnings, and dangers */
+
+.markdown-section blockquote.block-tip {
+    border-color: var(--c-tip);
+    background-color: var(--c-tip-bg);
+    color: var(--c-tip-text);
+    font-family: var(--font-family);
+}
+
+.markdown-section blockquote.block-tip h1 {
+    color: var(--c-tip-title);
+}
+
+.markdown-section blockquote.block-tip h2 {
+    color: var(--c-tip-title);
+}
+
+.markdown-section blockquote.block-tip h3 {
+    color: var(--c-tip-title);
+}
+
+.markdown-section blockquote.block-tip h4 {
+    color: var(--c-tip-title);
+}
+
+.markdown-section blockquote.block-tip h5 {
+    color: var(--c-tip-title);
+}
+
+.markdown-section blockquote.block-tip h6 {
+    color: var(--c-tip-title);
+}
+
+.markdown-section blockquote.block-warning {
+    border-color: var(--c-warning);
+    background-color: var(--c-warning-bg);
+    color: var(--c-warning-text);
+    font-family: var(--font-family);
+}
+
+.markdown-section blockquote.block-warning h1 {
+    color: var(--c-warning-title);
+}
+
+.markdown-section blockquote.block-warning h2 {
+    color: var(--c-warning-title);
+}
+
+.markdown-section blockquote.block-warning h3 {
+    color: var(--c-warning-title);
+}
+
+.markdown-section blockquote.block-warning h4 {
+    color: var(--c-warning-title);
+}
+
+.markdown-section blockquote.block-warning h5 {
+    color: var(--c-warning-title);
+}
+
+.markdown-section blockquote.block-warning h6 {
+    color: var(--c-warning-title);
+}
+
+.markdown-section blockquote.block-danger {
+    border-color: var(--c-danger);
+    background-color: var(--c-danger-bg);
+    color: var(--c-danger-text);
+    font-family: var(--font-family);
+}
+
+.markdown-section blockquote.block-danger h1 {
+    color: var(--c-danger-title);
+}
+
+.markdown-section blockquote.block-danger h2 {
+    color: var(--c-danger-title);
+}
+
+.markdown-section blockquote.block-danger h3 {
+    color: var(--c-danger-title);
+}
+
+.markdown-section blockquote.block-danger h4 {
+    color: var(--c-danger-title);
+}
+
+.markdown-section blockquote.block-danger h5 {
+    color: var(--c-danger-title);
+}
+
+.markdown-section blockquote.block-danger h6 {
+    color: var(--c-danger-title);
+}
+
+pre:has(code.language-mermaid[data-processed="true"]) {
+    background-color: #ffffff;
+    text-align: center;
+}
+
+:root {
+    --c-tip: #42b983;
+    --c-tip-bg: #e2f5ec;
+    --c-tip-text: #215d42;
+    --c-tip-title: #359469;
+    --c-warning: #e7c000;
+    --c-warning-bg: rgba(255, 229, 100, .25);
+    --c-warning-text: #6b5900;
+    --c-warning-title: #b29400;
+    --c-danger: #c00;
+    --c-danger-bg: #ffe0e0;
+    --c-danger-text: #600;
+    --c-danger-title: #c00;
+    --font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+/**
+ * Syntax highlighting styles
+ */
+.highlight {
+    background: #fff;
+}
+.highlighter-rouge .highlight {
+    background: #eef;
+}
+.highlight .c {
+    color: #998;
+    font-style: italic;
+}
+.highlight .err {
+    color: #a61717;
+    background-color: #e3d2d2;
+}
+.highlight .k {
+    font-weight: bold;
+}
+.highlight .o {
+    font-weight: bold;
+}
+.highlight .cm {
+    color: #998;
+    font-style: italic;
+}
+.highlight .cp {
+    color: #999;
+    font-weight: bold;
+}
+.highlight .c1 {
+    color: #998;
+    font-style: italic;
+}
+.highlight .cs {
+    color: #999;
+    font-weight: bold;
+    font-style: italic;
+}
+.highlight .gd {
+    color: #000;
+    background-color: #fdd;
+}
+.highlight .gd .x {
+    color: #000;
+    background-color: #faa;
+}
+.highlight .ge {
+    font-style: italic;
+}
+.highlight .gr {
+    color: #a00;
+}
+.highlight .gh {
+    color: #999;
+}
+.highlight .gi {
+    color: #000;
+    background-color: #dfd;
+}
+.highlight .gi .x {
+    color: #000;
+    background-color: #afa;
+}
+.highlight .go {
+    color: #888;
+}
+.highlight .gp {
+    color: #555;
+}
+.highlight .gs {
+    font-weight: bold;
+}
+.highlight .gu {
+    color: #aaa;
+}
+.highlight .gt {
+    color: #a00;
+}
+.highlight .kc {
+    font-weight: bold;
+}
+.highlight .kd {
+    font-weight: bold;
+}
+.highlight .kp {
+    font-weight: bold;
+}
+.highlight .kr {
+    font-weight: bold;
+}
+.highlight .kt {
+    color: #458;
+    font-weight: bold;
+}
+.highlight .m {
+    color: #099;
+}
+
+.highlight .n {
+    color: #111
+}
+
+.highlight .s {
+    color: #d14;
+}
+.highlight .na {
+    color: #008080;
+}
+.highlight .nb {
+    color: #0086B3;
+}
+.highlight .nc {
+    color: #458;
+    font-weight: bold;
+}
+.highlight .no {
+    color: #008080;
+}
+.highlight .ni {
+    color: #800080;
+}
+.highlight .ne {
+    color: #900;
+    font-weight: bold;
+}
+.highlight .nf {
+    color: #900;
+    font-weight: bold;
+}
+.highlight .nn {
+    color: #555;
+}
+.highlight .nt {
+    color: #000080;
+}
+.highlight .nv {
+    color: #008080;
+}
+.highlight .ow {
+    font-weight: bold;
+}
+.highlight .w {
+    color: #bbb;
+}
+.highlight .mf {
+    color: #099;
+}
+.highlight .mh {
+    color: #099;
+}
+.highlight .mi {
+    color: #099;
+}
+.highlight .mo {
+    color: #099;
+}
+.highlight .sb {
+    color: #d14;
+}
+.highlight .sc {
+    color: #d14;
+}
+.highlight .sd {
+    color: #d14;
+}
+.highlight .s2 {
+    color: #d14;
+}
+.highlight .se {
+    color: #d14;
+}
+.highlight .sh {
+    color: #d14;
+}
+.highlight .si {
+    color: #d14;
+}
+.highlight .sx {
+    color: #d14;
+}
+.highlight .sr {
+    color: #009926;
+}
+.highlight .s1 {
+    color: #d14;
+}
+.highlight .ss {
+    color: #990073;
+}
+.highlight .bp {
+    color: #999;
+}
+.highlight .vc {
+    color: #008080;
+}
+.highlight .vg {
+    color: #008080;
+}
+.highlight .vi {
+    color: #008080;
+}
+.highlight .il {
+    color: #099;
+}

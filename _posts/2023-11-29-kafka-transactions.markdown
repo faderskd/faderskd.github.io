@@ -1,36 +1,38 @@
 ---
 layout: post
 title:  "[Deep dive] Kafka transactions"
-date:   2023-11-29
+date:   2024-02-21
 ---
 
 ### Why Kafka needs transactions ?
-The most popular Kafka delivery mode is at least once. It means that it is tuned for reliability - each message will be persisted
-in the log without data loss. The downside is possibility of duplicates. In case of publishing failure the producer will retry. 
-The same applies to broker failures. While it provides background for many types of application, for some it is not
-enough. What if my app has stronger consistency requirements ? What if I need to ensure that the group of messages will be 
-persisted exactly once, so all of them are appended to the log or none of them ?
-That's why transactions were introduced to the Kafka. The main beneficiary was Kafka Streams. The motivation for it is
-broadly described in the [Kafka Transactions proposal](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging#KIP98ExactlyOnceDeliveryandTransactionalMessaging-Status),
-but for the sake of this post lets come up with an example similar to transactions in SQL databases.
+The most popular Kafka delivery guarantee is at least once. It means that the producing app is tuned for reliability - 
+each message will be persisted in the log without data loss. The downside is the possibility of duplicates. 
+In case of publishing failure, the producer will retry. The same applies to broker failures. While it provides background 
+for many types of applications, for some it is not enough. What if my app has stronger consistency requirements? What if 
+I need to ensure that the group of messages will be persisted exactly once to multiple topics, so all of them are appended 
+to the log or none of them? That's why transactions were introduced to Kafka. The main beneficiary was Kafka Streams. 
+The motivation for it is broadly described in the [Kafka Transactions proposal](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging#KIP98ExactlyOnceDeliveryandTransactionalMessaging-Status),
+but for the sake of this post let's come up with an example similar to transactions in SQL databases.
 
 ### Problem statement
-Let's say we have an online shop app, with three Kafka topics: `purchase`, `invoices`, `shipments`. Whenever the customer buys
-a product, the `purchase` event is produced. It is then processed and two other events are produced:
+Let's say we have an online shop app, with three Kafka topics: `purchases`, `invoices`, and `shipments`. Whenever the customer buys
+a product, the `purchase` event is produced. It is then processed and two other events are created:
 `shipment` and `invoice`. 
 
-![three-topics.png](/img/transactions/three-topics.png)
+![three-topics.png]({{site.baseurl}}/img/transactions/three-topics.png)
 
-Obviously we don't want the situation where we make a shipment without processing invoice. We don't want the product
+Obviously, we don't want a situation where we make a shipment without processing the invoice. We don't want the product
 to be sent twice too. The `purchase` and `invoice` events should be published together (as a unit) or none of them.
 
 ### Eliminating duplicates
 
-[//]: # (// TODO: info about message treated like a batch.)
+> Whenever I say the `event` or `message` is published/received from Kafka,
+> in fact the batch of messages is published/received. It is easier to reason about them as a single message.
+{: .block-warning }  
 
-Let's focus on eliminating duplicates first. [I've created an example](TODO://link-do-repo) processing realizing above scenario.
-`KafkaConsumer` polls messages from Kafka. The message is then processed and two other events are produced. At the end the consumer
-commits the offset to the Kafka, so we don't process the same message twice:
+Let's focus on eliminating duplicates first. [I've created an example](TODO://link-do-repo) processing for the above scenario.
+`KafkaConsumer` polls message from Kafka. The message is then processed and two other events are produced. In the end, the consumer
+commits the offset to Kafka, so we don't process the same message twice:
 
 ```java
 public void start() {
@@ -63,19 +65,19 @@ public void start() {
 ```
 
 ### Idempotent producer
-Kafka has had an idempotent producer for a long time. It prevents from duplicated published events. Unfortunately, it happens 
-only in a single producer session. Nevertheless, it is a good staring point from which we can progress. 
+Kafka has had an idempotent producer for a long time. It prevents duplicated published events. Unfortunately, it works 
+only for a single producer session. Nevertheless, it is a good starting point from which we can progress. 
 
 #### Enabling idempotence 
 
 ```java
-props.setProperty("acks", "all"); // this must be set to `all`, if not specified, it will be default for idempotence 
+props.setProperty("acks", "all"); // this must be set to `all`. If not specified, it's default when idempotence enabled.  
 props.setProperty("enable.idempotence", "true"); // this enforces enabling idempotence
 ```
 
-The native Java client has the idempotence enabled by default, if there are no conflicting configurations.
+The native Java client has the idempotence enabled by default if there are no conflicting configurations.
 To enforce idempotence set `enable.idempotence` to true. It will then validate and enforce proper configuration. 
-Idempotent producer enforces `ACK all`. We will cover why when describing guarantees section. 
+Idempotent producer enforces `ACK all`. We will cover why when describing guarantees. 
 
 #### Producer and broker internal state
 Every time the idempotent producer sends a message (actually a batch of messages) it remember a sequence number of last message sent.
@@ -87,7 +89,7 @@ In case of any sending retries the message sent twice with the same sequence wil
 particular sequence can be stored in a log ? 
 To understand what's going on, we'll investigate the state kept by both the producer and the broker when enabled idempotent producer.
 
-![idempotent-producer.png](/img/transactions/idempotent-producer.png)
+![idempotent-producer.png]({{site.baseurl}}/img/transactions/idempotent-producer.png)
 
 The producer keeps ProducerId (PID) and mapping between TopicPartition and last produced sequence number. The PID is fetched
 from the broker (1). Producer sends messages together with its PID and base sequence number (2). The base sequence number 
@@ -122,7 +124,7 @@ contains PID and sequence number. These are persisted in the log and replicated.
 replicas build the same in-memory state. When the current leader fails, the new one elected will have the state fully 
 replicated (because of `ACK all`).
 
-![idempotence-broker-failure](/img/transactions/idempotence-broker-failure.png)
+![idempotence-broker-failure]({{site.baseurl}}/img/transactions/idempotence-broker-failure.png)
 
 // TODO: add info about markers
 ```shell
@@ -137,7 +139,7 @@ was replicated to the followers (2). When the producer retries to a new leader, 
 has proper in-memory state build from the log. It will reject duplicate. On the producer side the `DuplicateSequenceException` is thrown,
 so the producer knows it can skip the message. 
 
-![idempotence-fencing](/img/transactions/idempotence-fencing.png)
+![idempotence-fencing]({{site.baseurl}}/img/transactions/idempotence-fencing.png)
 
 #### Why idempotent producer if not enough ?
 As you see the idempotent producer is not a reliable solution for our case. It only prevents from duplicates in a single
@@ -220,12 +222,12 @@ it in a consistent manner. It works like this:
 4. Commit - now all 3 things (2 events and 1 offset move) are atomically saved to the Kafka, no partial results. If something wrong 
 goes here the transaction is aborted, and the consumers don't see aborted events.
 
-// TODO: add info that we can batch multiple tranactions into one but for simplicity we sequentially process records
+// TODO: add info that we can batch multiple transactions into one but for simplicity we sequentially process records
 
 ### Transaction compontents
 Ok, we can go deeper in each part of the transaction. It's time for drawings. 
 
-![transactions-components](/img/transactions/transactions-components.png)
+![transactions-components]({{site.baseurl}}/img/transactions/transactions-components.png)
 
 #### Transactional producer
 To enable transactional producer we need to turn on idempotency and add additional parameter: `transactional.id`.
@@ -260,7 +262,7 @@ Transaction log is replicated to the follower replicas for availability in case 
 producer.initTransactions();
 ```
 
-![transactions-initialization](/img/transactions/transactions-initialization.png)
+![transactions-initialization]({{site.baseurl}}/img/transactions/transactions-initialization.png)
 
 The first thing to do by a producer is to find its transaction coordinator. That's why it sends `FindCoordinatorRequest`(1) to any broker. 
 The broker then finds transaction coordinator and returns it to the producer (2). The algorithm is quite simple. It takes the hash from 
@@ -284,7 +286,7 @@ but the latter is used for distinguishing between multiple incorporates of the s
 
 #### Producer and broker internal state
 
-![transactional-state.png](/img/transactions/transactional-state.png)
+![transactional-state.png]({{site.baseurl}}/img/transactions/transactional-state.png)
 
 1. Similarly to the idempotent producer, transactional `KafkaProducer` keeps the mapping from topics partitions to the sequence number. 
 Because it has to avoid duplicates even in case of restarts it needs to remember its `transactional.id` and epoch number
@@ -308,7 +310,7 @@ producer.send(new ProducerRecord<>(INVOICES_TOPIC, mapper.writeValueAsString(inv
 producer.send(new ProducerRecord<>(SHIPMENTS_TOPIC, mapper.writeValueAsString(shipment)));
 ```
 
-![transactions-sending-messages.png](/img/transactions/transactions-sending-messages.png)
+![transactions-sending-messages.png]({{site.baseurl}}/img/transactions/transactions-sending-messages.png)
 
 Finally, the messages go to the broker, huh? Well, not quite. Before the producer sends messages to the brokers, it has to 
 record which topic partitions it's sending messages to. So it sends `AddPartitionsToTxnRequest`(1) to the coordinator. This information 
@@ -341,13 +343,13 @@ It is the last committed offset before crash. But this one is some before the la
 by confining offset commit as a part of transaction: message consuming, producing and offset committing happens together or 
 none of them.
 
-![transactions-committing-offsets.png](/img/transactions/transactions-committing-offsets.png)
+![transactions-committing-offsets.png]({{site.baseurl}}/img/transactions/transactions-committing-offsets.png)
 
 When adding offsets to transaction the producer sends `AddOffsetsToTxnRequest` (1). It contains basic transactional fields which 
 we've previously mentioned, and one additional field - consumer `groupId`. Base on this, the transaction coordinator calculates
 `__consumer_offsets` topic partition for our of consumer group (the consumer group of the `purchases` topic consumer). 
 You already know the algorithm. It is similar to one used in finding transactional coordinator.
-```
+```java
 var kafkaConsumerOffsetsTopicPartitionId = hash(purchasesConsumerGroupId) % consumerOffetsTopicPartitionsCount;
 ```
 As usual, it is added to the transaction coordinator state, and replicated via internal `__transaction_state` topic. 
@@ -357,7 +359,7 @@ We notified the transactional coordinator about offsets, now it's time to notify
 Under the hood`KafkaProducer` sends another `TxnOffsetCommitRequest` (2) to our consumer's coordinator. How to find a consumer group 
 coordinator ? 
 
-```
+```java
 var kafkaConsumerOffsetsTopicPartitionId = hash(purchasesConsumerGroupId) % consumerOffetsTopicPartitionsCount;
 var coordinatorId = leaderOf(kafkaConsumerOffsetsTopicPartitionId);
 ```
@@ -378,7 +380,7 @@ The last step is ending transaction. As in databases world we can commit or abor
 and consumers of the output topics can see its result. The abort makes all events in being part of the transaction invisible. 
 However, there is one requirement: you need to properly configure consumer. Before that, let's see what happens in the brokers. 
 
-![transactions-markers.png](/img/transactions/transactions-markers.png)
+![transactions-markers.png]({{site.baseurl}}/img/transactions/transactions-markers.png)
 
 The producer sends a `EndTxnRequest` (1) to the transaction coordinator. As usual, the request contains `transactionalId`, 
 `PID`, `epoch` and a marker `committed` indicating if to commit or abort. As usual the request contains some other fields, I've not covered 
@@ -419,14 +421,14 @@ The important thing is that even in `read_committed` mode there is no guarantee 
 all messages from single transaction. It consumes transactional committed messages only from the assigned partitions. Transaction 
 can span multiple partitions from multiple topics, part of them can be handled by different consumer instance (image below).
 
-![transactions-two-consumers.png](/img/transactions/transactions-two-consumers.png)
+![transactions-two-consumers.png]({{site.baseurl}}/img/transactions/transactions-two-consumers.png)
 
 #### Broker's LSO and consumer index
 
 The messages returned to the apps are always in their offset order. In `read_committed` mode, the consumer has to know upfront which 
 messages are aborted, so they are not exposed to the client. Take the following log as an example:
 
-![transactions-log-of-messages.png](/img/transactions/transactions-log-of-messages.png)
+![transactions-log-of-messages.png]({{site.baseurl}}/img/transactions/transactions-log-of-messages.png)
 
 While consuming messages in order, the consumer can't return messages with offsets 0 and 1. In case of abort, 
 it has to omit the offsets being part of aborted transaction. In other words, the consumer needs some aborted messages filter. 
@@ -434,7 +436,7 @@ This is the purpose of aborted transaction index. Thanks to this structure, the 
 so `read_committed` mode can filter them out. The index is build on the broker side, and returned to the consumer in the `FetchResponse` 
 together with ordinary messages data.
 
-![transactions-aborted-index.png](/img/transactions/transactions-aborted-index.png)
+![transactions-aborted-index.png]({{site.baseurl}}/img/transactions/transactions-aborted-index.png)
 
 The on-disk index structure:
 
@@ -449,13 +451,13 @@ pending transactions (without COMMIT/ABORT markers) will not be visible by the c
 the broker keeps LSO (last stable offset) in its memory. It indicates the offset below which all transactions have been resolved. 
 Without this, it would not be possible to build the transaction index, as pending transactions has no markers written yet.
 
-![transactions-lso.png](/img/transactions/transactions-lso.png)
+![transactions-lso.png]({{site.baseurl}}/img/transactions/transactions-lso.png)
 
 ### Full transactional flow
 
 As we already know all the transaction stages it is convenient to have a full picture in one place.
 
-![transactions-full-picture.png](/img/transactions/transactions-full-picture.png)
+![transactions-full-picture.png]({{site.baseurl}}/img/transactions/transactions-full-picture.png)
 
 That's a lot of steps, let's cover them in detail. 
 
@@ -511,15 +513,50 @@ broker's log via `KafkaProducer.send()` from point 5.
 
 ### Guarantees in failures scenarios
 
-Finally, as we know how everything works together we can discuss Kafka exactly one delivery guarantees. 
+Finally, as we know how everything works together, we can discuss Kafka exactly once delivery guarantees. 
 
-1. `KafkaProducer.send()` failure
-2. `KafkaProducer` failure
-3. `KafkaConsumer` failure (the one being part of consume-transform-produce loop)
-4. `KafkaConsumer` failure (the one consuming from target topics)
-4. Transaction coordinator
-5. Broker failure
-6. Consumer group coordinator failure
+1. `KafkaProducer.send()` failure - this is the case when error occurs during producing to target topics included in transaction. 
+The error can be a timeout or any other network problem. In this case the producer will simply 
+retry. Because we've configured idempotency the retry is safe. If the broker did not receive the message at all, 
+it will simply accept retired one. If the message was received, but the producer didn't get the response, the producer will 
+retry with previously sent sequence number. The broker rejects a message and returns `DUPLICATE_SEQUENCE_NUMBER` error response, 
+which can be ignored and producing continues with next message. **No duplicates**. 
+2. `KafkaProducer` failure - the producing application may fail or just restart at any time. The newly created transactional 
+producer invokes `producer.initTransactions()` which sends `InitPidRequest`. The coordinator aborts all ongoing transactions for `PID` 
+actually connected with to `transactionalId` sent in the request. Then it returns the same `PID` as for the old instance, but 
+bumps producer epoch and returns the response to the producer. The aborted transactions will never reach consumers with proper 
+isolation level. **No duplicates**. 
+3. `KafkaProducer` hangs for a long time - the producing app can hang for any reason, e.g. long GC pause. In a distributed environment, 
+the orchestration system like K8s can spawn a new instance when the first is not responding to the healthcheck. What if after 
+second instances just started, the first ended the pause and continue producing ? As in the previous case, the new instance 
+initiates transactions with `InitPidRequest` to the coordinator. The coordinator bumps producer epoch. The old producer is considered 
+zombie and will be fenced. Attempt to send a request to the coordinator with old producer epoch will end up with `PRODUCER_FENCED` error. Attempt 
+to send a produce request with old epoch to the broker will end up with `INVALID_PRODUCER_EPOCH` error. The brokers receiving messages knows that they 
+need to bump epoch because transaction coordinator sent them `ABORT` markers with increased epoch during transaction initialization. **No duplicates**.  
+4. `KafkaConsumer` failure (the one being part of consume-transform-produce loop) - the consumer fetching messages from source topic 
+may fail before producing new messages to target topics. In this case the application starts consuming from last committed offset. 
+Source topic offsets are being part of transaction, so we know that the starting offsets has not been included in committed transaction. 
+**No duplicates**. 
+5. `KafkaConsumer` failure (the one consuming from target topics) - let's say that the application consuming from target 
+transaction topics (`invoices`/`shipments`) sends requests to some external services. Normally, it gets message from Kafka, sends 
+requests, commit offsets and the process repeats. What is the application crashes after sending requests but before getting the response ?
+It will start processing transactional messages once again, from last committed offset, it will send duplicates. Kafka transactions work only 
+in the Kafka topics itself. There is no protection from consuming committed transactions twice. The `read_committed` isolation level 
+only protects from consuming aborted transactions. We would need some external validation if specific messages were already processed. 
+**Duplicates may happen**.
+6. Transaction coordinator failure - the transaction coordinator replicates `__transaction_state` to follower replicas. In case 
+of crash, the new leader of the transaction log topic partition is elected. It then continues handling transactions. There is no need to abort 
+transactions started in the failed coordinator. The new one was updating the in-memory state while replicating the log. 
+Transactional `KafkaProducer` is notified about new leader by fetching metadata from other brokers. **No duplicates**. 
+7. Broker failure - the brokers receiving `ProduceRequest` with data may fail too. Similar mechanism applies here as in the case of 
+coordinator failure. The new data partition leader is elected. It previously replicated messages from failed leader. 
+It has been updating its in-memory state with `PID` to `sequence_number` mapping. `KafkaProducer` idempotence enforces `ack all`, 
+so data partition replicas have up-to-date sequence numbers. **No duplicates**.   
+8. Consumer group coordinator failure - consumer fetching from source topic takes starting partition offsets form its 
+consumer group coordinator. The internal `__consumer_offsets` topic is replicated to the followers. If the current coordinator fails 
+during transaction, new `__consumer_offsets` topic partition leader will be elected as a new group coordinator and the 
+transaction will continue as normal. Offsets committed as a part of committed transaction will not be returned twice to the same 
+consumer group. **No duplicates**. 
 
 [//]: # (```shell)
 [//]: # (root@kafka2:/tmp/kraft-combined-logs/shipments-1# /opt/kafka/bin/kafka-dump-log.sh --files 00000000000000000000.log)
