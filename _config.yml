@@ -4,7 +4,7 @@ longtitle:        Kafka (b)log
 author:           Daniel Fąderski
 email:            daniel.faderski@gmail.com
 description: >
-  Kafka blog aiming to learn unknown parts of known topics.
+  Kafka blog aiming to describe unknown parts of known topics.
 
 version:          1.0
 gitbook_version:  3.2.3

@@ -1,9 +1,9 @@
 ---
 title: About
-author: Tao He
-date: 2022-02-04
-category: Jekyll
+author: Daniel Fąderski
+date: 2024-03-07
+category: Kafka
 layout: post
 ---
 
-This is an about page.
+
