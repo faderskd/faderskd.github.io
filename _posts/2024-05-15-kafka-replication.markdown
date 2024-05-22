@@ -92,6 +92,36 @@ controller on the other hand manages the cluster. At this moment it is important
 topic creation command, the request is directed to the controller and the controller assigns partitions of a topic to the 
 specific brokers. The controller chooses a leader partition too**. 
 
+So how the controller assigns partitions to the brokers ? The actual algorithm takes into consideration both number of 
+brokers and the racks where there are situated in a server room. For us, we can assume that we 
+have all brokers on the same rack. Kafka controller tries to distribute partitions evenly so each of the partition is on 
+a different broker. That's why it spreads partitions using round-robin algorithm, and for each next partition it offsets starting broker, 
+so each leader is on a different broker. If you're curious of the details you can read it [here]((https://github.com/apache/kafka/blob/5552f5c26df4eb07b2d6ee218e4a29e4ca790d5c/metadata/src/main/java/org/apache/kafka/metadata/placement/StripedReplicaPlacer.java#L72)).
+
+Let's say we want to create a `test` topic with 3 partitions, each replicated across 3 replicas. 
+We have also 3 brokers with ids: 1, 2, 3.
+
+```
+             ----------------- The first node in assignment is a leader. The placement assigns brokers to parititions 
+             |                 using round-robin. Leaders offsets by one for each new partition to avoid choosing
+             |                 the same broker for each partiton's leader.
+             |         
+partition 1: 1, 2, 3
+partition 2: 2, 3, 1
+partition 3: 3, 1, 2
+```
+
+How it does look like in reality ? Well, almost the same :)
+```
+./kafka-topics.sh --create --topic test --bootstrap-server localhost:9092 --replication-factor 3 --partitions 3
+Created topic test.
+
+./kafka-topics.sh --describe --topic test --bootstrap-server localhost:9092
+
+Topic: test     TopicId: ha0jRlepRvasAGLxmyx60A PartitionCount: 3       ReplicationFactor: 3    Configs: segment.bytes=1073741824
+        Topic: test     Partition: 0    Leader: 1       Replicas: 1,2,3 Isr: 1,2,3
+        Topic: test     Partition: 1    Leader: 2       Replicas: 2,3,1 Isr: 2,3,1
+        Topic: test     Partition: 2    Leader: 3       Replicas: 3,1,2 Isr: 3,1,2
+```
 
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
-// TODO: command for creating a topic with 3 partitions
