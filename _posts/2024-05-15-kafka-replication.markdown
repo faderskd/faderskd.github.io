@@ -124,4 +124,35 @@ Topic: test     TopicId: ha0jRlepRvasAGLxmyx60A PartitionCount: 3       Replicat
         Topic: test     Partition: 2    Leader: 3       Replicas: 3,1,2 Isr: 3,1,2
 ```
 
+### Cluster Metadata
+
+We've discovered the topic structure and how the partitions are assigned to the different brokers. The next puzzle 
+is how the clients know where to send and fetch messages from. As we've mentioned `ProduceRequest` and `FetchRequests` 
+goes to the partitions leaders. To find them, clients send `MetadataRequest` to any broker in a cluster. Each broker 
+keeps cluster-wide metadata information on disk. The usual brokers learn about metadata changes from... Kafka controller. 
+So every admin change e.g. increasing the number of partitions in a topic goes to the controller. The controller 
+propagates the change to the usual brokers via metadata fetch API, and then clients fetch metadata from the brokers.
+
+// P3 
+
+On the picture above, the brokers use `FetchRequests` to get updates about metadata. Internally, metadata is a topic and 
+brokers use the existing API between them to fetch the newest metadata information. Producers and consumers on the other
+hand, use dedicated `MetadataRequest` for receiving metadata information. They request information about interested
+topics, their partition and leaders. Details can be found [here](https://kafka.apache.org/protocol.html#The_Messages_Metadata).
+
+### Replicas vs In-Sync Replicas
+As I explained previously, once the `KafkaProducer` sends the `ProduceRequest` to the partition leader, the broker saves 
+the message, and then follower replicas keep up by fetching it using `FetchRequest` api. Let's take as an example the 
+previously created topic with 3 partitions. For partition `0` there are 3 replicas `Replicas: 1,2,3`. The leader is `1`, the
+followers are `2,3`. Each of the follower has different pace of replication. They are independent nodes. While replicating, 
+the leader tracks each follower's replication progress, so it can assess which of them are fast and which can't keep up. 
+The topic partition is a log of records, and each record has its offset.
+
+![partition-with-offsets.png]({{site.baseurl}}/img/replication/partition-with-offsets.png)
+
+The leader tracks each of the follower's fetching offset. 
+
+![ledader-tracking-followers.png]({{site.baseurl}}/img/replication/leader-tracking-followers.png)
+
+
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
