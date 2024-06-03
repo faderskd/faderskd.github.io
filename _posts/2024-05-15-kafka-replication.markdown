@@ -154,5 +154,27 @@ The leader tracks each of the follower's fetching offset.
 
 ![ledader-tracking-followers.png]({{site.baseurl}}/img/replication/leader-tracking-followers.png)
 
+Now, we can understand the concept Kafka heavily depends on to ensure safety and correctness of replication: `in-sync-replicas`.
+For each topic partition, Kafka maintains a curated set of nodes which are in-sync. At a high level, these are the healthy brokers 
+that can keep up with fetching the newest messages from leader. The [documentation](https://kafka.apache.org/documentation/#replication)
+says that to be in-sync:
+
+```
+1. Brokers must maintain an active session with the controller in order to receive regular metadata updates.
+2. Brokers acting as followers must replicate the writes from the leader and not fall "too far" behind.
+```
+
+And there are two broker configs for these conditions:
+1. [broker.session.timeout.ms](https://kafka.apache.org/documentation/#brokerconfigs_broker.session.timeout.ms)
+   Remember the controller right ? So each time the broker fetches metadata, it informs controller that it is alive. If
+   the time configured as the first config passed between two consecutive metadata fetches, the broker is not in-sync
+   anymore.
+2. [replica.lag.time.max.ms](https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms)
+   Each time the same broker fetches messages from specific topic partition's leader, and it got to the end of the log,
+   the leader records the timestamp when that happened. If the time passed between current time and the last fetch to
+   the end of the log is greater than `replica.lag.time.max.ms` the replica hosted by the broker is thrown out 
+   of in-sync replicas set.
+ 
+   
 
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
