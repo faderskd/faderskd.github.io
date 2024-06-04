@@ -146,17 +146,18 @@ the message, and then follower replicas keep up by fetching it using `FetchReque
 previously created topic with 3 partitions. For partition `0` there are 3 replicas `Replicas: 1,2,3`. The leader is `1`, the
 followers are `2,3`. Each of the follower has different pace of replication. They are independent nodes. While replicating, 
 the leader tracks each follower's replication progress, so it can assess which of them are fast and which can't keep up. 
-The topic partition is a log of records, and each record has its offset.
+To recall, the topic partition is a log of records, and each record has its offset.
 
 ![partition-with-offsets.png]({{site.baseurl}}/img/replication/partition-with-offsets.png)
 
-The leader tracks each of the follower's fetching offset. 
+The leader tracks each of the follower's fetching offset.  
 
-![ledader-tracking-followers.png]({{site.baseurl}}/img/replication/leader-tracking-followers.png)
 
-Now, we can understand the concept Kafka heavily depends on to ensure safety and correctness of replication: `in-sync-replicas`.
-For each topic partition, Kafka maintains a curated set of nodes which are in-sync. At a high level, these are the healthy brokers 
-that can keep up with fetching the newest messages from leader. The [documentation](https://kafka.apache.org/documentation/#replication)
+![leader-tracking-followers.png]({{site.baseurl}}/img/replication/leader-tracking-followers.png)
+
+We can now comprehend the concept Kafka heavily depends on to ensure safety and correctness of replication: `in-sync-replicas` (ISR).
+For each topic partition, Kafka maintains a curated set of nodes which are in-sync. At a high level, these are the **healthy** brokers 
+that **can keep up with fetching the newest messages** from leader. The [documentation](https://kafka.apache.org/documentation/#replication)
 says that to be in-sync:
 
 ```
@@ -165,16 +166,25 @@ says that to be in-sync:
 ```
 
 And there are two broker configs for these conditions:
-1. [broker.session.timeout.ms](https://kafka.apache.org/documentation/#brokerconfigs_broker.session.timeout.ms)
+1. [broker.session.timeout.ms](https://kafka.apache.org/documentation/#brokerconfigs_broker.session.timeout.ms) -
    Remember the controller right ? So each time the broker fetches metadata, it informs controller that it is alive. If
    the time configured as the first config passed between two consecutive metadata fetches, the broker is not in-sync
    anymore.
-2. [replica.lag.time.max.ms](https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms)
+2. [replica.lag.time.max.ms](https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms) -
    Each time the same broker fetches messages from specific topic partition's leader, and it got to the end of the log,
-   the leader records the timestamp when that happened. If the time passed between current time and the last fetch to
-   the end of the log is greater than `replica.lag.time.max.ms` the replica hosted by the broker is thrown out 
-   of in-sync replicas set.
- 
-   
+   the leader records the timestamp when that happened. If the time that passed between **current time** and the **last fetch 
+   which got to the end of the log** is greater than `replica.lag.time.max.ms` the replica hosted by the broker is thrown out 
+   of in-sync replicas set. 
+
+![leader-isr-state.png]({{site.baseurl}}/img/replication/leader-isr-state.png)
+
+The second timeout is a little bit harder to understand. The picture above shows that replicas R2 and R3 fetch from different 
+positions from leader's log. The `Partition state` is a global view of the partition in a Kafka cluster. 
+The `Leader state` is calculated locally by the partition leader. Each time the replica got to the end of the log 
+(`FetchRequest{offset=100}` in this case) the leader sets the `lastCaughtUpTimeMs` timestamp for that replica. 
+Then, the leader periodically checks if each replica fulfills IRS condition:
+`now() - lastCaughtUpTimeMs <= replica.lag.time.max.ms`. If not, that replica is thrown out of the ISR. For now, just assume 
+that the leader somehow changes global Kafka view of that partition. So for example if replica `R2` fall out of IRS the 
+global view of the partition would be like: `Replicas: [R1, R2, R2], Leader: R1, ISR = [R1, R3]`.
 
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
