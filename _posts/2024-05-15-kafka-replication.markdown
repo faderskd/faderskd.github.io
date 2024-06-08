@@ -65,12 +65,12 @@ events to the partition leaders. The `FetchRequest` is used both by the consumer
 Similarly to the consumers, follower replicas fetch messages from its partition leaders. 
 
 A command to create a topic:
-```shell
+```postgresql
 ./kafka-topics.sh --create --topic A --bootstrap-server localhost:9092 --replication-factor 2 --partitions 2
 ```
 
 A command to see the topic details:
-```shell
+```postgresql
 ./kafka-topics.sh --describe --topic A --bootstrap-server localhost:9092
 
 Topic: A        TopicId: D7DUpsdPTPqXnfigwjKHAg PartitionCount: 2       ReplicationFactor: 2    Configs: segment.bytes=1073741824
@@ -101,7 +101,7 @@ so each leader is on a different broker. If you're curious of the details you ca
 Let's say we want to create a `test` topic with 3 partitions, each replicated across 3 replicas. 
 We have also 3 brokers with ids: 1, 2, 3.
 
-```
+```postgresql
              ----------------- The first node in assignment is a leader. The placement assigns brokers to parititions 
              |                 using round-robin. Leaders offsets by one for each new partition to avoid choosing
              |                 the same broker for each partiton's leader.
@@ -112,7 +112,7 @@ partition 3: 3, 1, 2
 ```
 
 How it does look like in reality ? Well, almost the same :)
-```
+```postgresql
 ./kafka-topics.sh --create --topic test --bootstrap-server localhost:9092 --replication-factor 3 --partitions 3
 Created topic test.
 
@@ -140,6 +140,19 @@ brokers use the existing API between them to fetch the newest metadata informati
 hand, use dedicated `MetadataRequest` for receiving metadata information. They request information about interested
 topics, their partition and leaders. Details can be found [here](https://kafka.apache.org/protocol.html#The_Messages_Metadata).
 
+### Replication from leader
+
+As I mentioned before, the follower replicas use the `FetchRequest` for requesting messages from leader. For now, just
+assume that the only parameter is offset. So, `FetchRequest(offset=x)` means that:
+1. the requesting replica wants messages with offsets `>= x`
+2. the requesting replica confirms that it persisted locally all messages with offsets `< x` (and now it wants more)
+3. the leader replica seeing that request returns messages with offset `>= x` and save in its internal state that the
+requesting replica has all messages with offsets `< x`.
+
+The end of the broker's log for a particular partition is called `LEO` (Log End Offset). It indicates, that broker/replica has
+messages with offsets up to `LEO - 1`. So `LEO` is the first offset that the replica doesn't have yet. For example, if the 
+replica has log of messages with offsets `[0,1,2,3,4,5]`, its `LEO=6`.
+
 ### Replicas vs In-Sync Replicas
 As I explained previously, once the `KafkaProducer` sends the `ProduceRequest` to the partition leader, the broker saves 
 the message, and then follower replicas keep up by fetching it using `FetchRequest` api. Let's take as an example the 
@@ -160,7 +173,7 @@ For each topic partition, Kafka maintains a curated set of nodes which are in-sy
 that **can keep up with fetching the newest messages** from leader. The [documentation](https://kafka.apache.org/documentation/#replication)
 says that to be in-sync:
 
-```
+```postgresql
 1. Brokers must maintain an active session with the controller in order to receive regular metadata updates.
 2. Brokers acting as followers must replicate the writes from the leader and not fall "too far" behind.
 ```
@@ -186,5 +199,81 @@ Then, the leader periodically checks if each replica fulfills IRS condition:
 `now() - lastCaughtUpTimeMs <= replica.lag.time.max.ms`. If not, that replica is thrown out of the ISR. For now, just assume 
 that the leader somehow changes global Kafka view of that partition. So for example if replica `R2` fall out of IRS the 
 global view of the partition would be like: `Replicas: [R1, R2, R2], Leader: R1, ISR = [R1, R3]`.
+
+### Consumer's message visibility, watermark and committed messages.
+
+The question that comes to mind when thinking about messages replication is: when the consumers can see the published message ?
+Provided that they constantly fetches new messages, the general answer would be: 
+when all in-sync replicas fetch up to (inclusive) the message offset. Let's investigate what that exactly means
+
+// P5
+
+The picture above is considered for topic with replication factor 3. The producer published 5 messages. They were given Kafka offsets: `0,1,2,3,4` 
+(remember that offsets starts from 0). The messages `0,1,2` were already replicated by all current in-sync replicas. The 
+message `3` was replicated only by one follower, so 2/3 in-sync replicas has the copy. The offset of the message, 
+below which all messages were replicated by all in-sync replicas is called **high watermark**. Everything below that threshold 
+is visible to the consumers. So if the high watermark is at offset `X`, all messages visible to the consumers are `<= X-1`. 
+That part of the log is also called the committed log. Consider the high watermark as an indicator of the safely 
+stored part of the log. This is an important thing to understand how Kafka provides high reliability in different failure 
+scenarios. We'll get to that.
+
+Let's find out how and when exactly the high watermark is moved forward.
+
+We have the following setup:
+
+```postgresql
+TopicA - partitions: 1 (one partition P1 for simplicity), replication factor: 3 (leader and two followers)
+leader = R1
+replicas = [R1, R2, R3]
+ISR (in-sync replicas) = [R1, R2, R3]
+```
+
+I'll use the marker `T[X]` for designating time progression. Remember that `LEO` is log end offset, and it is the next offset 
+that the replica doesn't have yet for partition `P`. The leader moves the high watermark, and it's tracking each
+of the followers `LEO`.
+
+```postgresql
+----------------------------------T1--------------------------------------------
+KafkaProducer publishes 3 messages with offsets 0,1,2 to the leader R1.
+
+R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 0, R3 LEO = 0
+R2          | log = []
+R3          | log = []
+----------------------------------T2--------------------------------------------
+Replica R2 sends FetchRequest(offset=0) to the leader, the leader responds with messages it has in log. Note that 
+R2 LEO didn't change as the leader has not been confirmed about persisting the messages by the follwoer. It has to wait for 
+the next FetchRequest(offset=3) to be sure that previous offsets were saved. 
+
+R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 0, R3 LEO = 0
+R2          | log = [0,1,2]
+R3          | log = []
+----------------------------------T3--------------------------------------------
+The replica R3 sends FetchRequest(offset=0) to the leader, the leader responds with messages it has in log. The same 
+situation as above. The replica didn't confirm getting the messages yet. The high watermark cannot be moved forward. 
+
+R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 0, R3 LEO = 0
+R2          | log = [0,1,2]
+R3          | log = [0,1,2]
+----------------------------------T4--------------------------------------------
+The replica R2 sends FetchRequest(offset=3) to the leader, the leader has no messages with offset >= 3 so it doesn't return any  
+messages. But now, the leader nows that replica R2 persisted messages with offset < 3. The high watermark cannot be 
+moved forward as there is still one in-sync replica R3 which didn't confirmed the getting the message. 
+
+R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 3, R3 LEO = 0
+R2          | log = [0,1,2]
+R3          | log = [0,1,2]
+----------------------------------T5--------------------------------------------
+The replica R3 sends FetchRequest(offset=3) to the leader, the leader has no messages with offset >= 3 so it doesn't return any  
+messages. But now, the leader nows that replica R3 persisted messages with offset < 3. The high watermark is moved forward 
+because all in-sync replicas confirmed getting messages with offset < 3. The high watermark similarly to the LEO is 
+greater by 1 than the last message offset in the committed log.
+
+R1 (leader) | log = [0,1,2], HighWatermark = 3, R1 LEO = 3, R2 LEO = 3, R3 LEO = 3
+R2          | log = [0,1,2]
+R3          | log = [0,1,2] 
+```
+// TODO - continue scenario just like in picture P5 
+
+### 
 
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
