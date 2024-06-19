@@ -203,21 +203,20 @@ global view of the partition would be like: `Replicas: [R1, R2, R2], Leader: R1,
 ### Consumer's message visibility, watermark and committed messages.
 
 The question that comes to mind when thinking about messages replication is: when the consumers can see the published message ?
-Provided that they constantly fetches new messages, the general answer would be: 
-when all in-sync replicas fetch up to (inclusive) the message offset. Let's investigate what that exactly means
+when all in-sync replicas replicate the published message. Let's investigate what that exactly means
 
 // P5
 
-The picture above is considered for topic with replication factor 3. The producer published 5 messages. They were given Kafka offsets: `0,1,2,3,4` 
+The picture above contains a topic with replication factor 3. The producer published 5 messages with offsets: `0,1,2,3,4` 
 (remember that offsets starts from 0). The messages `0,1,2` were already replicated by all current in-sync replicas. The 
-message `3` was replicated only by one follower, so 2/3 in-sync replicas has the copy. The offset of the message, 
+messages `3,4` were replicated only by one follower, so 2/3 of in-sync replicas has the copy. The offset of the message, 
 below which all messages were replicated by all in-sync replicas is called **high watermark**. Everything below that threshold 
 is visible to the consumers. So if the high watermark is at offset `X`, all messages visible to the consumers are `<= X-1`. 
-That part of the log is also called the committed log. Consider the high watermark as an indicator of the safely 
+That part of the log is also called the **committed log**. Consider the high watermark as an indicator of the safely 
 stored part of the log. This is an important thing to understand how Kafka provides high reliability in different failure 
 scenarios. We'll get to that.
 
-Let's find out how and when exactly the high watermark is moved forward.
+Let's find out how and when exactly the high watermark is moved forward. 
 
 We have the following setup:
 
@@ -228,9 +227,10 @@ replicas = [R1, R2, R3]
 ISR (in-sync replicas) = [R1, R2, R3]
 ```
 
-I'll use the marker `T[X]` for designating time progression. Remember that `LEO` is log end offset, and it is the next offset 
+I'll use the marker `T[X]` for designating the time progression. Remember that `LEO` is the log end offset, and it is the next offset 
 that the replica doesn't have yet for partition `P`. The leader moves the high watermark, and it's tracking each
-of the followers `LEO`.
+of the followers `LEO`. I purposely show `LEO` and watermark only on a leader. In reality, each of the replica tracks 
+its own `LEO` and high watermark, but I'll omit it now for simplicity. 
 
 ```postgresql
 ----------------------------------T1--------------------------------------------
@@ -241,7 +241,7 @@ R2          | log = []
 R3          | log = []
 ----------------------------------T2--------------------------------------------
 Replica R2 sends FetchRequest(offset=0) to the leader, the leader responds with messages it has in log. Note that 
-R2 LEO didn't change as the leader has not been confirmed about persisting the messages by the follwoer. It has to wait for 
+R2 LEO didn't change as the leader has not yet been confirmed about persisting the messages by the follower. It has to wait for 
 the next FetchRequest(offset=3) to be sure that previous offsets were saved. 
 
 R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 0, R3 LEO = 0
@@ -255,24 +255,57 @@ R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 0, R3 LEO =
 R2          | log = [0,1,2]
 R3          | log = [0,1,2]
 ----------------------------------T4--------------------------------------------
-The replica R2 sends FetchRequest(offset=3) to the leader, the leader has no messages with offset >= 3 so it doesn't return any  
-messages. But now, the leader nows that replica R2 persisted messages with offset < 3. The high watermark cannot be 
-moved forward as there is still one in-sync replica R3 which didn't confirmed the getting the message. 
+KafkaConsumer (client app) sends FetchRequest(offset=0) to the leader. The leader doesn't respond with any messages 
+because the high watermark is 0.
+----------------------------------T5--------------------------------------------
+The replica R2 sends FetchRequest(offset=3) to the leader, the leader has no messages with offset >= 3, so it doesn't return any  
+messages. But now, the leader knows that replica R2 persisted messages with offset < 3. The R2 LEO changes, and 
+points to the next message offset not present in the R2 log. The high watermark cannot be 
+moved forward as there is still one in-sync replica R3, which didn't confirm getting the message. 
 
 R1 (leader) | log = [0,1,2], HighWatermark = 0, R1 LEO = 3, R2 LEO = 3, R3 LEO = 0
 R2          | log = [0,1,2]
 R3          | log = [0,1,2]
-----------------------------------T5--------------------------------------------
-The replica R3 sends FetchRequest(offset=3) to the leader, the leader has no messages with offset >= 3 so it doesn't return any  
-messages. But now, the leader nows that replica R3 persisted messages with offset < 3. The high watermark is moved forward 
-because all in-sync replicas confirmed getting messages with offset < 3. The high watermark similarly to the LEO is 
-greater by 1 than the last message offset in the committed log.
+----------------------------------T6--------------------------------------------
+The replica R3 sends FetchRequest(offset=3) to the leader, the leader has no messages with offset >= 3, so it doesn't return any  
+messages. But now, the leader knows that replica R3 persisted messages with offset < 3. The R3 LEO changes to 3. 
+All in-sync replicas now reached the offsets 3: have their LEO=3. The high watermark can move forward, because all in-sync replicas confirmed 
+getting messages with offset < 3. To be more precise: the high watermark can progress when all in-sync replicas' LEO exceeds current  
+watermark. Because current HighWatermark = 0 and R1 LEO = 3, R2 LEO = 3, R3 LEO = 3, the leader can set watermark to 3 as well.
+The [0,1,2] is now committed log and is visible to KafkaConsumer clients. 
 
 R1 (leader) | log = [0,1,2], HighWatermark = 3, R1 LEO = 3, R2 LEO = 3, R3 LEO = 3
 R2          | log = [0,1,2]
-R3          | log = [0,1,2] 
+R3          | log = [0,1,2]
+
+----------------------------------T7--------------------------------------------
+KafkaProducer publishes 2 messages with offsets 3,4 to the leader R1.
+
+R1 (leader) | log = [0,1,2,3,4], HighWatermark = 3, R1 LEO = 5, R2 LEO = 3, R3 LEO = 3
+R2          | log = [0,1,2]
+R3          | log = [0,1,2]
+----------------------------------T8--------------------------------------------
+The replica R2 sends FetchRequest(offset=3) to the leader, the leader responds with 2 messages [3,4] with offset >= 3. 
+R2 LEO does not change on the leader, because it lacks of the message persistence confirmation - the leader has to 
+wait for FetchRequest(offset=5) from R2 to confirm saving new messages. 
+The high watermark does not move forward. It can only progress when all in-sync replicas' LEO exceeds the current 
+watermark. 
+
+R1 (leader) | log = [0,1,2,3,4], HighWatermark = 3, R1 LEO = 3, R2 LEO = 3, R3 LEO = 3
+R2          | log = [0,1,2,3,4]
+R3          | log = [0,1,2]
+----------------------------------T9--------------------------------------------
+The replica R2 sends FetchRequest(offset=5) to the leader, the leader has not any messages with offset >= 5. The leader 
+changes its state for R2 LEO to 5 as it got confirmation for saving messages with offset < 5. The high watermark does not 
+change as there is still a replica R3, which is in-sync, and its LEO <= high watermark. 
+
+R1 (leader) | log = [0,1,2,3,4], HighWatermark = 3, R1 LEO = 5, R2 LEO = 5, R3 LEO = 3
+R2          | log = [0,1,2]
+R3          | log = [0,1,2]
+----------------------------------T10--------------------------------------------
+KafkaConsumer (client app) sends FetchRequest(offset=0) to the leader. The leader responds with messages having 
+offset < high watermark: [0,1,2] which is a committed log.
 ```
-// TODO - continue scenario just like in picture P5 
 
 ### 
 
