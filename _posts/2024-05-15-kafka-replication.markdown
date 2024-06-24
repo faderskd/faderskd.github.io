@@ -138,7 +138,8 @@ propagates the change to the usual brokers via metadata fetch API, and then clie
 On the picture above, the brokers use `FetchRequests` to get updates about metadata. Internally, metadata is a topic and 
 brokers use the existing API between them to fetch the newest metadata information. Producers and consumers on the other
 hand, use dedicated `MetadataRequest` for receiving metadata information. They request information about interested
-topics, their partition and leaders. Details can be found [here](https://kafka.apache.org/protocol.html#The_Messages_Metadata).
+topics, their partition and leaders. Details can be found [here](https://kafka.apache.org/protocol.html#The_Messages_Metadata)
+(scroll to the latest version). 
 
 ### Replication from leader
 
@@ -180,8 +181,8 @@ says that to be in-sync:
 
 And there are two broker configs for these conditions:
 1. [broker.session.timeout.ms](https://kafka.apache.org/documentation/#brokerconfigs_broker.session.timeout.ms) -
-   Remember the controller right ? So each time the broker fetches metadata, it informs controller that it is alive. If
-   the time configured as the first config passed between two consecutive metadata fetches, the broker is not in-sync
+   Remember the controller right ? The simple brokers inform the controller that they are alive via heartbeat requests. If
+   the time configured as this config passed between two consecutive heartbeat requests, the broker is not in-sync
    anymore.
 2. [replica.lag.time.max.ms](https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms) -
    Each time the same broker fetches messages from specific topic partition's leader, and it got to the end of the log,
@@ -307,6 +308,40 @@ KafkaConsumer (client app) sends FetchRequest(offset=0) to the leader. The leade
 offset < high watermark: [0,1,2] which is a committed log.
 ```
 
-### 
+### Shrinking ISR
+
+We said that for advancing the watermark, all in-sync replicas have to replicate the message. But what happens if one of 
+the replica becomes unavailable or slow ? Effectively, it can't keep up with a replication. Without a special treatment 
+we would end up with an unavailable partition - the HW can't progress and consumers can't see new messages. Obviously we 
+can't just wait for a replica until its recovery, this is not something a highly-available system would do. 
+Kafka handles such a situation by shrinking the ISR. You remember the two [conditions](#replicas-vs-in-sync-replicas) 
+for a replica to stay in-sync, right ? I didn't mention what exactly happens. There are basically two scenarios when
+the conditions stop applying:
+
+1. The unhealthy replica stops sending heartbeats to the controller. The controller fences a replica. That means, it 
+is removed from the ISR of all its topic partitions. This implies losing leadership too. If the removed replica is a leader 
+for any partitions, the controller performs leader election and pick one of the broker from the new ISR as a new leader.
+That information is disseminated across cluster metadata (from controller -> to other brokers -> and to clients).
+
+// P7
+// P8
+
+2. The second party allowed to modify the partition's ISR (besides the controller) is a partition leader. 
+A replica that does not fetch data at all or fetches it too slow, is removed from ISR by a leader of that partition. The 
+leader sends an `AlterPartition` request to the controller with the new ISR. The controller persists that information 
+in metadata which is then spread across the cluster. 
+
+// P9: TODO
+
+// TODO: 
+
+###  Min-ISR
+
+### Preferred leader and leader failover
+
+Each Kafka topic partition has a leader replica chosen by a controller during topic creation. This is called a preferred leader 
+replica. I previously explained how Kafka assigns leaders to brokers. leadership can change.
+
 
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
+// TODO: what about ELR ? maybe just add information at the end 
