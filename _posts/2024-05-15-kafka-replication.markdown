@@ -31,13 +31,22 @@ they were written within a *single topic partition*. I'll write a different post
 ### How many partitions 
 
 When choosing the number of partition there is a general advice: calculate it. You can set then a little higher number when 
-anticipating growth. Remember that you can only increase the number of partitions. Kafka denies decreasing this number. 
-The number of partitions will depend on the speed of consumers consuming from Kafka. Before we do the calculation let's come 
-up with a simplified statement: **that a single partition can be consumed only by one consumer**. Those of you 
-who are familiar with consumer groups, will now that it is true only within a single consumer group, but forget about it now. 
-So for example if a single consumer's max throughput is 100 m/s (messages per second) and expected incoming traffic to a 
+anticipating growth. Keep in mind that you can only increase the number of partitions. Kafka denies decreasing this number. 
+The number of partitions most of the time will depend on the speed of consumers consuming from Kafka. 
+Before we do the calculation let's come up with a simplified statement: **that a single partition can be consumed only by one consumer**. 
+Those of you who are familiar with consumer groups, will now that it is true only within a single consumer group, but forget about it now. 
+So for example, if a single consumer's max throughput is 100 m/s (messages per second) and expected incoming traffic to a 
 Kafka topic is 500 m/s, you will need at least 5 consumers running in parallel. Because single partition can be serviced by a single 
-consumer we'll need at least 5 Kafka partitions.
+consumer, we'll need at least 5 Kafka partitions.
+
+> [INFO]  
+> I purposely focus only on the consuming side in the calculation. We didn't take into account if that number of partition is enough
+> for writing given throughput to the topic. I assume that most of the time the bottleneck will be the application rather than a 
+> Kafka itself. We can scale number of producers independently of the number of partitions, but the parallel consumers are limited by the 
+> number of partitions. 
+{: .block-tip }
+
+The general advice is: `partitionsCount = expectedThroughput / throughputOfASingleConsumer`
 
 ### Increasing availability and durability - Partition leaders and followers
 
@@ -222,7 +231,7 @@ Let's find out how and when exactly the high watermark is moved forward.
 We have the following setup:
 
 ```postgresql
-TopicA - partitions: 1 (one partition P1 for simplicity), replication factor: 3 (leader and two followers)
+TopicA - partitions: 1 (one partition P1 for simplicity), replication factor: 3 (leader and 2 followers)
 leader = R1
 replicas = [R1, R2, R3]
 ISR (in-sync replicas) = [R1, R2, R3]
@@ -323,19 +332,85 @@ is removed from the ISR of all its topic partitions. This implies losing leaders
 for any partitions, the controller performs leader election and pick one of the broker from the new ISR as a new leader.
 That information is disseminated across cluster metadata (from controller -> to other brokers -> and to clients).
 
-// P7
-// P8
+// P6 TODO
+// P7 TODO
 
 2. The second party allowed to modify the partition's ISR (besides the controller) is a partition leader. 
 A replica that does not fetch data at all or fetches it too slow, is removed from ISR by a leader of that partition. The 
-leader sends an `AlterPartition` request to the controller with the new ISR. The controller persists that information 
+leader sends then `AlterPartitionRequest` to the controller with the new ISR. The controller persists that information 
 in metadata which is then spread across the cluster. 
 
+// P8: TODO
 // P9: TODO
 
-// TODO: 
+### Expanding ISR
 
-###  Min-ISR
+Assuming the partition has a leader, adding a replica to the ISR can be only done by that current leader. Once the 
+out-of-sync replica caught-up to the leader's log it is added to the ISR by leader issuing the `AlterPartitionRequest` 
+to the controller. 
+What if there is no leader for partition ? It can be the case that all replicas for example restarted. In this 
+case the controller elects a leader and then saves that information in metadata (that will eventually go to the replicas). 
+The rest of the replicas will join the ISR by catching up to the leader. 
+
+###  Min-ISR (minimum in-sync-replicas) and AKCs (acknowledgements)
+
+You've probably header that in a distributed systems world, sooner or later we will come across a choice if we want our 
+system to be available or consistent in a failure scenarios. In Kafka, this choice is made by collaboration of 
+client side `KafkaProducer` and the Kafka brokers itself. Until now, we've mentioned that the `KafkaProducer` just publishes 
+messages to the leader, then the replicas pull the messages, so they eventually end up on a few independent brokers. 
+We didn't specify when the producer should state the message was written to the topic:
+1. When just the leader saves the message on a local machine without waiting for replication from follower ? What if the 
+leader crashed a short time after acknowledging but before the replication (eventually) happens ?
+2. When all ISR replicas replicate it ? We know, that the ISR is a curated list of currently available and healthy partition replicas. 
+We know it is dynamic. It can be event limited to the leader in a difficult time. It can be even empty!  
+3. When some minimal number of ISR confirms ? How many brokers should get the copy, so we consider it a safe value ? This 
+is what a kafka topic `min.in.sync.replicas` property configures. The documentation can be found [here](https://kafka.apache.org/documentation/#topicconfigs_min.insync.replicas).
+
+The Min-ISR basically tells the leader of the partition for how many of the ISR (including itself) it should wait before 
+giving the positive acknowledge response to the `KafkaProducer`. But this is not the end, I said that the `KafkaProducer` 
+participates in the decision-making process. That's why we have the following producer configuration: [acks](https://kafka.apache.org/documentation/#producerconfigs_acks).
+I recommend to reading the documentation, but in case you don't:
+1. `acks=0` - it is a fire and forget type of sending. We don't care about saving the message in Kafka. We assume most 
+of the time the cluster (and producing app) is working fine and most of the messages will survive. 
+2. `acks=1` - wait until the replica leader stores the message in a local log, and don't care if it was replicated 
+by followers
+3. `acks=all` - wait until all the message is written to the leader an all in-sync replicas. If the number of ISR 
+falls below Min-ISR the producer gets an error. 
+
+Note that in any case of `acks=0/1/all` the consumers see messages only after the message is committed. That means 
+that the leader waits for all current ISR to advance the HW (high watermark). We know that consumers see messages 
+only up to the HW. Additionally, if the condition `Min-ISR >= ISR` is not met, the watermark cannot advance. 
+So even if message was published with `ack=0/1`, it is available for consumers when all ISR replicated up to that 
+message offset and the number of ISR is at least Min-ISR. 
+
+# How Min-ISR and ACK affects consistency and availability  
+
+1. How many concurrent failures we can survive with `min.in.sync.replicas` set to X and ACK all?
+2. How many concurrent failures we can survive with `min.in.sync.replicas` set to X and ACK leader?
+3. What is the availability of the system with `min.in.sync.replicas` set to X and ACK all?
+4. What is the availability of the system with `min.in.sync.replicas` set to X and ACK leader?
+
+# Min-ISR examples
+
+Because setting a `min.in.sync.replicas` (on a topic or broker) and `acks` (on KafkaProducer) is one of the most important 
+configuration for availability and consistency, I'd like to provide you a few examples for different application requirements. 
+
+1. `replication.factor=4`, `min.in.sync.replicas=3`, `acks=all` - this config provides high consistency. Each message is 
+replicated to at least 3 brokers before getting success response. We can survive up to 2 concurrent But we can tolerate only 1 broker failure for being 
+available. If 2/4 of the replicas are unavailable, the 2 remaining are not enough to fulfill `MinISR>=3` condition. 
+2. `replication.factor=4`, `min.in.sync.replicas=2`, `acks=all` - moderate consistency and availability. 
+
+
+
+
+
+
+
+
+
+
+
+
 
 ### Preferred leader and leader failover
 
@@ -344,4 +419,24 @@ replica. I previously explained how Kafka assigns leaders to brokers. leadership
 
 
 // TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
-// TODO: what about ELR ? maybe just add information at the end 
+// TODO: what about ELR ? maybe just add information at the end
+Let's take the following non-functional requirements that we want for application producing to Kafka to fulfill:
+1. [Durability] The data should be replicated to 4 replicas.
+2. [Consistency] No message should be lost after it has been saved and acknowledged by Kafka. We should survive
+3. [Availability] In the failure conditions the producing should be highly available. We should survive up to 2 failed replicas
+   and still be able to produce.
+
+We've created a topic:
+```postgresql
+TopicA - partitions: 1 (one partition P1 for simplicity), replication factor: 4 (leader and 3 followers)
+leader = R1
+replicas = [R1, R2, R3, R4]
+ISR (in-sync replicas) = [R1, R2, R3, R4]
+```
+
+Now let's collate the configuration with the requirement:
+1. OK, we have a topic :)
+2. OK, the data is replicated to 4 replicas. If they are all healthy, they can keep up with replication. They all are
+   in-sync (ISR = [R1, R2, R3, R4])
+3. OK, if 
+
