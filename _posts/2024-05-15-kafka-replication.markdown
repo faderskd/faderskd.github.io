@@ -352,9 +352,11 @@ What if there is no leader for partition ? It can be the case that all replicas 
 case the controller elects a leader and then saves that information in metadata (that will eventually go to the replicas). 
 The rest of the replicas will join the ISR by catching up to the leader. 
 
+### How Kafka persists messages
+
 ###  Min-ISR (minimum in-sync-replicas) and AKCs (acknowledgements)
 
-You've probably header that in a distributed systems world, sooner or later we will come across a choice if we want our 
+You've probably heard that in a distributed systems world, sooner or later we will come across a choice if we want our 
 system to be available or consistent in a failure scenarios. In Kafka, this choice is made by collaboration of 
 client side `KafkaProducer` and the Kafka brokers itself. Until now, we've mentioned that the `KafkaProducer` just publishes 
 messages to the leader, then the replicas pull the messages, so they eventually end up on a few independent brokers. 
@@ -383,43 +385,87 @@ only up to the HW. Additionally, if the condition `Min-ISR >= ISR` is not met, t
 So even if message was published with `ack=0/1`, it is available for consumers when all ISR replicated up to that 
 message offset and the number of ISR is at least Min-ISR. 
 
-# How Min-ISR and ACK affects consistency and availability  
+### Preferred leader and leader failover
+
+Each Kafka topic partition has a leader replica chosen by a controller during topic creation. This is called a preferred leader
+replica. I previously explained how Kafka assigns leaders to brokers. leadership can change.
+
+# Min-ISR examples
+
+Because setting a `min.in.sync.replicas` (on a topic or broker) and `acks` (on KafkaProducer) is one of the most important 
+configuration for availability and consistency, I'd like to provide you a few examples for different application requirements. 
+The `unclean.leader.election.enable` is `false`. 
+
+1. `replication.factor=4`, `min.in.sync.replicas=3`, `acks=all` - this config provides a high consistency. Each message is 
+replicated to **at least** 3 brokers before getting success response. During the healthy brokers condition, the ISR will be 4, 
+so `ack=all` will wait for 4 brokers. One of the brokers can fail (`ISR=3`), and we still have `ISR >= MinISR`, and we still can produce 
+messages. Losing one more broker (`ISR=2`) affects availability as the `ISR >= MinISR` won't apply anymore. In a pessimistic 
+scenario (`ISR=3`) where we can still produce, the partition can survive up to 2 concurrent failures without losing data. 
+We still would have one node with a complete *committed* log. It could be then elected as (or remain) the leader and 
+the rest of the brokers could replicate after recovery. In an optimistic scenario (`ISR=4`), we would obviously survive 
+not more than 3 concurrent crashes. To sum up: we can tolerate up to 1 broker crashes being still available, and 2 concurrent (`MinISR - 1`) failures.
+2. `replication.factor=4`, `min.in.sync.replicas=2`, `acks=all` - moderate consistency and availability. We can tolerate 
+up to 2 (`ISR=2`) unhealthy replicas while providing availability, but then we can lose only one partition (`MinISR - 1`) without 
+data loss. 
+3. `replication.factor=4`, `min.in.sync.replicas=3`, `acks=leader` - we favour availability over consistency. The leader 
+responds successfully after storing messages in its local log. By using this configuration, you accept the possibility of 
+losing some events when only one broker fails. The lost are these acknowledged by the leader, but still not 
+replicated by `ISR` - which is a non-committed part of the log. The reality is that you can lose messages in more scenarios 
+than just leader failure. As the author of series [posts](https://jack-vanlightly.com/blog/2018/9/14/how-to-lose-messages-on-a-kafka-cluster-part1) 
+shows, the networking problems are even worse. Nevertheless, once we accept a possibility of data loss, we get very high availability:
+in the worst case (`ISR=3`) we can lose 2 (`MinISR - 1`) brokers and still being able to produce. In an optimistic scenario (`ISR=4`), we can 
+run even event without 3 brokers. 
+4. `replication.factor=4`, `min.in.sync.replicas=1`, `acks=all` - we favor availability over consistency when there are 
+problems with replicas/network, but when the cluster is healthy, we want to replicate to higher number of replicas - 
+current `ISR`. When replicas performs well, the `ISR` > 1, and leader will acknowledge events when all `ISR` replicate. 
+The messages are available for consumers after replication to the full `ISR`. But, in case of emergency, the `ISR` can even 
+shrink to the leader, and we still be able to produce/consume (`MinISR=1`).
+This may seem like a non-practical scenario: why to enforce higher consistency when everything goes well, but when not, 
+just forget about it accept losing data ? Compared to any `acks=leader` configuration, this will be more reliable during 
+leader restarts. For example, the leader rebooted ungracefully, the rest of the `ISR` was fine in that time. The leader 
+could acknowledge some messages before the restart, by writing them to the page cache, which is not synchronized immediately to disk. 
+If the producing was made with `acks=leader`, the leader didn't wait for `ISR` before acknowledging, which when followed by a 
+shutdown could end up with a data loss. If the producer used `acks=all`, the leader waited for all current `ISR` before acknowledging. 
+This means that the new leader from the current `ISR` had to have all acknowledged messages - no data loss. 
+
+In all cases I used `replication.factor` 4 but is up to you to decide what redundancy you want to have. The higher the 
+number of replicas, the higher possibility of increasing `MinISR`. Larger `MinISR` positively affects availability for 
+`acks=leader`, and consistency for `akcs=all`. But remember that higher number of replicas indicates higher network, storage, 
+CPU utilization. The brokers have much more work to during the replication. Finally, the end-to-end latency will suffer too. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
+// TODO: what about ELR ? maybe just add information at the end
 
 1. How many concurrent failures we can survive with `min.in.sync.replicas` set to X and ACK all?
 2. How many concurrent failures we can survive with `min.in.sync.replicas` set to X and ACK leader?
 3. What is the availability of the system with `min.in.sync.replicas` set to X and ACK all?
 4. What is the availability of the system with `min.in.sync.replicas` set to X and ACK leader?
 
-# Min-ISR examples
-
-Because setting a `min.in.sync.replicas` (on a topic or broker) and `acks` (on KafkaProducer) is one of the most important 
-configuration for availability and consistency, I'd like to provide you a few examples for different application requirements. 
-
-1. `replication.factor=4`, `min.in.sync.replicas=3`, `acks=all` - this config provides high consistency. Each message is 
-replicated to at least 3 brokers before getting success response. We can survive up to 2 concurrent But we can tolerate only 1 broker failure for being 
-available. If 2/4 of the replicas are unavailable, the 2 remaining are not enough to fulfill `MinISR>=3` condition. 
-2. `replication.factor=4`, `min.in.sync.replicas=2`, `acks=all` - moderate consistency and availability. 
-
-
-
-
-
-
-
-
-
-
-
-
-
-### Preferred leader and leader failover
-
-Each Kafka topic partition has a leader replica chosen by a controller during topic creation. This is called a preferred leader 
-replica. I previously explained how Kafka assigns leaders to brokers. leadership can change.
-
-
-// TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
-// TODO: what about ELR ? maybe just add information at the end
 Let's take the following non-functional requirements that we want for application producing to Kafka to fulfill:
 1. [Durability] The data should be replicated to 4 replicas.
 2. [Consistency] No message should be lost after it has been saved and acknowledged by Kafka. We should survive
