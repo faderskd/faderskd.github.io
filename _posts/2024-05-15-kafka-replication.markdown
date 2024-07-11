@@ -5,7 +5,7 @@ date:   2024-05-15
 ---
 
 > [INFO]  
-> The post covers the replication for Kafka version using KRaft (>=3.0).
+> The post covers the replication for Kafka version (>=3.7).
 {: .block-tip }
 
 ### Replication
@@ -354,29 +354,31 @@ The rest of the replicas will join the ISR by catching up to the leader.
 
 ### How Kafka persists messages
 
+// TODO
+
 ###  Min-ISR (minimum in-sync-replicas) and AKCs (acknowledgements)
 
-You've probably heard that in a distributed systems world, sooner or later we will come across a choice if we want our 
-system to be available or consistent in a failure scenarios. In Kafka, this choice is made by collaboration of 
-client side `KafkaProducer` and the Kafka brokers itself. Until now, we've mentioned that the `KafkaProducer` just publishes 
+You've probably heard that in a distributed systems world, sooner or later you will come across a choice between 
+availability or consistency during failure scenarios. In Kafka, this choice is made by a collaboration of 
+both client - `KafkaProducer` and the Kafka broker itself. Until now, we've mentioned that the `KafkaProducer` just publishes 
 messages to the leader, then the replicas pull the messages, so they eventually end up on a few independent brokers. 
-We didn't specify when the producer should state the message was written to the topic:
-1. When just the leader saves the message on a local machine without waiting for replication from follower ? What if the 
-leader crashed a short time after acknowledging but before the replication (eventually) happens ?
-2. When all ISR replicas replicate it ? We know, that the ISR is a curated list of currently available and healthy partition replicas. 
-We know it is dynamic. It can be event limited to the leader in a difficult time. It can be even empty!  
-3. When some minimal number of ISR confirms ? How many brokers should get the copy, so we consider it a safe value ? This 
+We didn't specify when the producer should state that message was written to the topic:
+1. When just the leader saves the message on a local machine without waiting for replication from the followers ? What if the 
+leader crashed a short time after acknowledging, but before the replication happens ?
+2. When all ISR replicas replicate the message ? We know, that the ISR is a curated list of currently available and healthy partition replicas. 
+We know it is dynamic. It can be even limited to the leader alone. It can be even empty!  
+3. When some minimal number of ISR confirms ? How many brokers should get the copy, so we consider it as safely replicated ? This 
 is what a kafka topic `min.in.sync.replicas` property configures. The documentation can be found [here](https://kafka.apache.org/documentation/#topicconfigs_min.insync.replicas).
 
-The Min-ISR basically tells the leader of the partition for how many of the ISR (including itself) it should wait before 
-giving the positive acknowledge response to the `KafkaProducer`. But this is not the end, I said that the `KafkaProducer` 
+The Min-ISR tells the leader of the partition, for how many of the ISR (including itself) it should wait before 
+giving the positive acknowledge response to the client. But this is not the end, I said that the `KafkaProducer` 
 participates in the decision-making process. That's why we have the following producer configuration: [acks](https://kafka.apache.org/documentation/#producerconfigs_acks).
 I recommend to reading the documentation, but in case you don't:
 1. `acks=0` - it is a fire and forget type of sending. We don't care about saving the message in Kafka. We assume most 
 of the time the cluster (and producing app) is working fine and most of the messages will survive. 
 2. `acks=1` - wait until the replica leader stores the message in a local log, and don't care if it was replicated 
-by followers
-3. `acks=all` - wait until all the message is written to the leader an all in-sync replicas. If the number of ISR 
+by followers.
+3. `acks=all` - wait until message is written to the leader and all in-sync replicas. If the number of ISR 
 falls below Min-ISR the producer gets an error. 
 
 Note that in any case of `acks=0/1/all` the consumers see messages only after the message is committed. That means 
@@ -396,50 +398,69 @@ replica. I previously explained how Kafka assigns leaders to brokers. leadership
 
 Setting all previously mentioned configurations:
 
-* number of replicas (`replication.factor`) 
-* minimum in-sync-replicas (`min.in.sync.replicas`)
-* unclean leader election (`unclean.leader.election.enable`)
 * `acks` on a `KafkaProducer`
+* minimum in-sync-replicas (`min.in.sync.replicas`)
+* number of replicas (`replication.factor`) 
+* unclean leader election (`unclean.leader.election.enable`)
 
 requires understanding how they affect availability and consistency. Before doing anything, start with answering the question: do you 
 accept losing any data ? Do you accept that the produced message may never be delivered to the consumers even when Kafka responded 
-successfully during publishing ? Most of the time, the Kafka cluster will work smoothly, but you have to prepare for hard times too:
+successfully during publishing ? Most of the time, Kafka will work fine, but you have to prepare for the hard times too:
 * broker disk failures
 * slow network
 * network partitions (some of the brokers cannot communicate with others)
 * broker ungraceful shutdowns
 * broker machine disasters
 
-What is more important to you when the above conditions arise ?
+What is more important when the above conditions arise ?
 
-**Availability** - being able to produce messages despite the fact that some of them may be permanently missed  
+**Availability** - being able to produce messages despite the fact that some of them may be permanently gone  
 **Consistency** - stop producing and throwing errors when there is not enough replicas to provide expected durability
 
-When you know the answer, then you can lean toward set of configuration adjusted to the requirements.  
+When you know the answer, then you can lean toward set of configuration adjusted to these requirements.  
 
 **Availability:**
 1. **`acks=1`** - only leader confirms during producing, no need to wait for higher number of replicas before acknowledging 
 the messages. Note that this concerns only write availability. The leader does not return any messages to the consumer until 
 they are replicated to the current `ISR`. If the `ISR < Min-ISR` then the high watermark cannot progress, and the consumption 
-stops despite the progress in writing. 
+stops despite successful writing.
 2. **lower `min.in.sync.replicas`** - as mentioned in the previous point, for `acks=1`, the `Min-ISR` does not affect producing, but will 
-always affect consuming. The consumers can only fetch committed messages. These are below the high watermark. The high watermark 
-progression is limited by the `Min-ISR`. Be aware, that when setting higher `Min-ISR` and producing with `acks=1`, the consumers 
-fetch messages replicated to the higher number of replicas. You gain more predictable consuming process, because in case of 
-a leader crash, Kafka has still a valid replica with a complete committed log. It can be useful for example, for providing 
-more consistency into reprocessing the same topic multiple times. Remember that higher `Min-ISR` means also increasing end-to-end latency.
-3. **higher `replication.factor`** - 
-4. **unclean.leader.election.enable** set to true - 
+always affect consuming. The consumers can only fetch committed messages. These are messages with offsets below the high watermark,
+replicated to at least `Min-ISR` number of brokers (the high watermark progression depends on condition `ISR >= Min-ISR`). 
+While higher `Min-ISR` puts a restriction (and delay) on a consuming process, it also increases predictability for consumers. They get 
+messages only once they are stored on multiple machines. For example, reprocessing the same topic multiple times, interleaved with the 
+failure conditions in the meantime, results in a more consistent view of messages. 
+If you want to use `acks=all`, lowering `min.in.sync.replicas` will increase the producing availability as well. 
+3. **higher `replication.factor`** - the more replicas you have, the more of them can serve as the `ISR`. For `ack=1` higher 
+number of `ISR` means broader choice of the valid replica during leader failover. For `acks=all`, more `ISR` means greater chances 
+that `ISR >= MIN-ISR` while some of the replicas are unavailable. However, when nodes are healthy, more replicas causes waiting for a higher 
+number of `ISR` replicas before committing the message. And obviously, brokers has more work to do because of replication. 
+4. **unclean.leader.election.enable** set to `true` - when the subset of nodes with a complete committed data (`ISR`) failed, you 
+favor electing not up-to-date (outside of `ISR`), but alive node as the leader, rather than waiting for one of the `ISR` to recover. 
 
-# Performance 
+**Consistency**
+1. **`acks=all`** - leader waits for all replicas in current `ISR` before acknowledging to the client. If `ISR < MinISR` then 
+return errors. The visibility for consumers and high watermark progression is the same as for `acks=1`
+2. **higher `min.in.sync.replicas`** - should be lower than `replication.factor` to have some space for availability as well 
+3. **higher `replication.factor`** - same as in the availability section 
+4. **unclean.leader.election.enable** set to `false` - only replicas with a complete committed log (`ISR`) can become a leader. 
+When no currently available, the whole partition is nonfunctional, but will not lose data (when one of the `ISR` recovers).
 
-// TODO
+### Performance 
+We graded different configurations in terms of availability and consistency, but they have also impact on performance. 
 
-# Configurations examples
+1. **`acks=1`** - causes better write latency as the leader doesn't wait for all `ISR` to confirm messages. The consumer 
+still has to wait for full `ISR`.
+2. **`acks=all`** - increased write latency. On consumers side nothing changes.
+3. **`replication.factor`** - higher number of replicas indicates higher network, storage and CPU utilization. The brokers 
+have much more work to do because of the replication. And finally, the end-to-end latency will increase too.
 
-I'd like to provide you a few examples for different application requirements. The `unclean.leader.election.enable` is `false`. 
+### Configurations examples
 
-1. `replication.factor=4`, `min.in.sync.replicas=3`, `acks=all` - this config provides high consistency at the cost of 
+I'd like to provide you a few examples showing the implications of mixing different configurations. 
+The `unclean.leader.election.enable` is `false`. 
+
+1. **`replication.factor=4`, `min.in.sync.replicas=3`, `acks=all`** - this config provides high consistency at the cost of 
 availability and write latency. Each message is replicated to **at least** 3 brokers (including leader) before getting success response. 
 During the healthy brokers condition, the `ISR=4`, so `ack=all` will wait for all 4 brokers. One of the brokers can 
 fail (`ISR=3`), and we still have `ISR >= Min-ISR` condition met, so we still can produce messages. Losing one more broker 
@@ -447,20 +468,20 @@ fail (`ISR=3`), and we still have `ISR >= Min-ISR` condition met, so we still ca
 for writes, it can survive up to 2 further replicas failures without losing data.   
 In such an extreme situation, there still would be one node with a complete *committed* log, which would be elected as 
 the leader, so rest of the brokers could replicate from it after recovery. In a common scenario (`ISR=4`) we would 
-survive up to 3 replicas crashes. To sum up: we can tolerate up to 1 broker crashes while being available for writes, 
+survive up to 3 replicas crashes. To sum up: we can tolerate up to 1 broker crashes while still being available for writes, 
 and then 2 concurrent (`Min-ISR - 1`) failures without losing data.  
-2. `replication.factor=4`, `min.in.sync.replicas=2`, `acks=all` - moderate consistency and availability. We can tolerate 
-up to 2 (`ISR=2`) unhealthy replicas while providing availability, but then we can lose only one additional 
-partition (`Min-ISR - 1`) without data loss.  
-3. `replication.factor=4`, `min.in.sync.replicas=2`, `acks=leader` - we favour availability over consistency. The leader 
+2. **`replication.factor=4`, `min.in.sync.replicas=2`, `acks=all`** - moderate consistency and availability. We can tolerate 
+up to 2 unhealthy replicas while providing availability, but then we can lose only one additional partition (`Min-ISR - 1`) 
+without losing data.  
+3. **`replication.factor=4`, `min.in.sync.replicas=2`, `acks=leader`** - we favour availability over consistency. The leader 
 responds successfully after storing messages in its local log, before replication to the rest of the `ISR` happens. 
 By using this configuration, you accept the possibility of losing some events. The lost are those acknowledged by the leader,
-but still not replicated by the `ISR` - which is a **non-committed** part of the log. The reality is that you can lose messages in more scenarios 
+but still not replicated by the `ISR` - which is a non-committed part of the log. The reality is that you can lose messages in more scenarios 
 than just leader failure. As the author of series [posts](https://jack-vanlightly.com/blog/2018/9/14/how-to-lose-messages-on-a-kafka-cluster-part1) 
-shows, the networking problems are even worse. Nevertheless, once we accept the possibility of occasional data loss, 
+shows, the networking problems are even worse (the post investigates Kafka with Zookeeper). Nevertheless, once we accept the possibility of occasional data loss, 
 we get very high availability: we can run even without 3 brokers. Note that the consumers will see the data once it is 
 replicated by the `Min-ISR=2`.  
-4. `replication.factor=4`, `min.in.sync.replicas=1`, `acks=all` - we favor availability over consistency in case of emergency,
+4. **`replication.factor=4`, `min.in.sync.replicas=1`, `acks=all`** - we favor availability over consistency in case of emergency,
 but when the cluster is healthy, we want to replicate to a higher number of replicas - current `ISR`. 
 When all replicas perform well, the `ISR=4`, and leader will acknowledge events when all `ISR` replicate.
 The messages are then available for consumers after replication to the full `ISR=4`. But, in case of emergency, the `ISR` can even 
@@ -471,25 +492,7 @@ leader restarts. For example, the leader rebooted ungracefully, the rest of the 
 could acknowledge some messages before the restart, by writing them to the page cache, which is not synchronized immediately to disk. 
 If the producing was made with `acks=leader`, the leader didn't wait for `ISR` before acknowledging, which when followed by the 
 shutdown could end up with a data loss. But in our case, the producer used `acks=all`. The leader waited for all current `ISR` 
-before acknowledging. This means that the new leader from the current `ISR` had to have all acknowledged messages - no data loss. 
-
-In all cases I used `replication.factor=4`, but is up to you to decide what redundancy you want to have. The higher the 
-number of replicas, the higher producing availability for `ack=leader`, and higher possibility of increasing `Min-ISR`. 
-Larger `Min-ISR` positively affects consistency for `akcs=all`. But remember that higher number of replicas indicates 
-higher network, storage, CPU utilization. The brokers have much more work to do because of the replication. 
-And finally, the end-to-end latency will increase too. 
-
-
-
-
-
-
-
-
-
-
-
-
+before acknowledging. This means that the new leader from the current `ISR` had to have all acknowledged messages - no data loss.
 
 
 
