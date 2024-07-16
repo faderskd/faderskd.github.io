@@ -352,9 +352,6 @@ What if there is no leader for partition ? It can be the case that all replicas 
 case the controller elects a leader and then saves that information in metadata (that will eventually go to the replicas). 
 The rest of the replicas will join the ISR by catching up to the leader. 
 
-### How Kafka persists messages
-
-// TODO
 
 ###  Min-ISR (minimum in-sync-replicas) and AKCs (acknowledgements)
 
@@ -386,6 +383,24 @@ that the leader waits for all current ISR to advance the HW (high watermark). We
 only up to the HW. Additionally, if the condition `Min-ISR >= ISR` is not met, the watermark cannot advance. 
 So even if message was published with `ack=0/1`, it is available for consumers when all ISR replicated up to that 
 message offset and the number of ISR is at least Min-ISR. 
+
+### How Kafka persists messages
+
+By default, the Kafka broker does not flush the data directly to the non-volatile disk storage. Except it stores the
+messages to the OS I/O memory - [page cache](https://en.wikipedia.org/wiki/Page_cache). This can be controlled via `flush.messages`. 
+When set to `1` Kafka will flush every message batch to the disk and only then acknowledge it to the client. But then 
+you can see significant [drop in performance](https://www.confluent.io/blog/kafka-fastest-messaging-system/#fsync). 
+The recommendation it to leave the default config. That means that message confirmed by the leader (`acks=1`) is not 
+necessarily written disk. The same applies for `acks=all` - all `ISR` replicas confirmed storing the message in the local OS page cache. 
+
+// P10: TODO
+
+The OS will eventually flush the page cache when it becomes full. The same happens during the graceful OS shutdown. 
+Because of this asynchronous flushing nature, the acknowledged, but not yet flushed messages can be lost when the broker 
+experience a sudden failure.  
+Leveraging the page cache provides lower response times and nice performance. But is it safe ? And why I'm talking about 
+it during replication ? It turns out, that Kafka benefits from the asynchronous message flushing thanks to using strong 
+replication protocol, providing safety without requiring fsync.  
 
 ### Preferred leader and leader failover
 
@@ -447,13 +462,18 @@ return errors. The visibility for consumers and high watermark progression is th
 When no currently available, the whole partition is nonfunctional, but will not lose data (when one of the `ISR` recovers).
 
 ### Performance 
-We graded different configurations in terms of availability and consistency, but they have also impact on performance. 
 
+We graded different configurations in terms of availability and consistency, but they have also impact on performance:  
 1. **`acks=1`** - causes better write latency as the leader doesn't wait for all `ISR` to confirm messages. The consumer 
 still has to wait for full `ISR`.
 2. **`acks=all`** - increased write latency. On consumers side nothing changes.
 3. **`replication.factor`** - higher number of replicas indicates higher network, storage and CPU utilization. The brokers 
 have much more work to do because of the replication. And finally, the end-to-end latency will increase too.
+4. **`min.in.sync.replicas`** - this does not affect the performance, the leader waits for all `ISR` when producing 
+with `acks=all` and when moving high watermark in any case. The `MinISR` does not affect write, end-to-end latency or 
+throughput. 
+
+// TODO maybe picture from here: https://www.confluent.io/blog/configure-kafka-to-minimize-latency/.
 
 ### Configurations examples
 
