@@ -386,28 +386,47 @@ message offset and the number of ISR is at least Min-ISR.
 
 ### How Kafka persists messages
 
-By default, the Kafka broker does not flush the data directly to the non-volatile disk storage. Except it stores the
-messages to the OS I/O memory - [page cache](https://en.wikipedia.org/wiki/Page_cache). This can be controlled via `flush.messages`. 
+By default, Kafka broker does not flush the data directly to the non-volatile storage. It stores the
+messages in the OS I/O memory - [page cache](https://en.wikipedia.org/wiki/Page_cache). 
+This can be controlled via `flush.messages`. 
 When set to `1` Kafka will flush every message batch to the disk and only then acknowledge it to the client. But then 
 you can see significant [drop in performance](https://www.confluent.io/blog/kafka-fastest-messaging-system/#fsync). 
-The recommendation it to leave the default config. That means that message confirmed by the leader (`acks=1`) is not 
-necessarily written disk. The same applies for `acks=all` - all `ISR` replicas confirmed storing the message in the local OS page cache. 
+The recommendation it to leave the default config - thus not doing fsync. That means that message confirmed by the leader (`acks=1`) is not 
+necessarily written to disk. The same applies for `acks=all` - all `ISR` replicas confirmed only storing the message in the local OS page cache. 
 
 // P10: TODO
 
-The OS will eventually flush the page cache when it becomes full. The same happens during the graceful OS shutdown. 
-Because of this asynchronous flushing nature, the acknowledged, but not yet flushed messages can be lost when the broker 
-experience a sudden failure.  
-Leveraging the page cache provides lower response times and nice performance. But is it safe ? And why I'm talking about 
-it during replication ? It turns out, that Kafka benefits from the asynchronous message flushing thanks to using strong 
-replication protocol, providing safety without requiring fsync.  
+The OS eventually flushes the pages from cache when it becomes full. The flushing also happens during the graceful OS shutdown. 
+Because of this asynchronous writing nature, the acknowledged, but not yet flushed messages can be lost when the broker 
+experiences a sudden failure. Note, that the page cache is retained when the Kafka process restarts. The page cache is managed 
+by the OS. The abrupt OS shutdown is something which can cause the data loss. 
+Leveraging the page cache provides improved response times and nice performance. But is it safe ? And why I'm talking about 
+it during the replication ? Kafka can afford asynchronous writing thanks to the usage of its replication protocol. 
+Part of it, is partition recovery. In the event of uncontrolled partition leader shutdown, where some of the messages may 
+have been lost (because done without fsync) the Kafka depends on the controller broker, which performs leader election for that partition. 
+The objective is to choose a leader with a complete log - the one from the current `ISR`. 
 
 ### Preferred leader and leader failover
 
-// TODO
+Each Kafka topic partition has a leader replica initially chosen by the controller during a topic creation. 
+I previously explained the algorithm for assignment the leaders to brokers. The leader assigned at the beginning is called 
+a preferred leader. It can be recognized by examining the output from kafka topic details.
 
-Each Kafka topic partition has a leader replica chosen by a controller during topic creation. This is called a preferred leader
-replica. I previously explained how Kafka assigns leaders to brokers. leadership can change.
+```postgresql
+ ./kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic=test
+
+Topic: test     TopicId: 2ZF_sUf2QjGHA5UJDFbY1g PartitionCount: 3       ReplicationFactor: 3    Configs: segment.bytes=1073741824
+        Topic: test     Partition: 0    Leader: 2       Replicas: 2,3,4 Isr: 2,3,4
+        Topic: test     Partition: 1    Leader: 3       Replicas: 3,4,1 Isr: 3,4,1
+        Topic: test     Partition: 2    Leader: 4       Replicas: 4,1,2 Isr: 4,1,2
+                                                                  ^
+                                                                  |
+                                              preferred leader ----
+```
+
+The preferred leader is the first one in the `Replicas` list. The leadership can change. These changes are triggered 
+by a few actions, and one of them is leader process shutdown. The graceful Kafka process shutdown unregisters the broker
+https://kafka.apache.org/35/documentation/#basic_ops_restarting
 
 ### Availability vs consistency
 
