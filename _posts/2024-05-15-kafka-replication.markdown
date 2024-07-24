@@ -190,7 +190,7 @@ says that to be in-sync:
 
 And there are two broker configs for these conditions:
 1. [broker.session.timeout.ms](https://kafka.apache.org/documentation/#brokerconfigs_broker.session.timeout.ms) -
-   Remember the controller right ? The simple brokers inform the controller that they are alive via heartbeat requests. If
+   Remember the controller right ? The regular brokers inform the controller that they are alive via heartbeat requests. If
    the time configured as this config passed between two consecutive heartbeat requests, the broker is not in-sync
    anymore.
 2. [replica.lag.time.max.ms](https://kafka.apache.org/documentation/#brokerconfigs_replica.lag.time.max.ms) -
@@ -398,8 +398,8 @@ necessarily written to disk. The same applies for `acks=all` - all `ISR` replica
 
 The OS eventually flushes the pages from cache when it becomes full. The flushing also happens during the graceful OS shutdown. 
 Because of this asynchronous writing nature, the acknowledged, but not yet flushed messages can be lost when the broker 
-experiences a sudden failure. Note, that the page cache is retained when the Kafka process restarts. The page cache is managed 
-by the OS. The abrupt OS shutdown is something which can cause the data loss. 
+experiences a sudden failure. Note, that the page cache is retained when the Kafka process fails. The page cache is managed 
+by the OS. The abrupt entire OS shutdown is something which can cause the data loss. 
 Leveraging the page cache provides improved response times and nice performance. But is it safe ? And why I'm talking about 
 it during the replication ? Kafka can afford asynchronous writing thanks to the usage of its replication protocol. 
 Part of it, is partition recovery. In the event of uncontrolled partition leader shutdown, where some of the messages may 
@@ -424,27 +424,69 @@ Topic: test     TopicId: 2ZF_sUf2QjGHA5UJDFbY1g PartitionCount: 3       Replicat
                                               preferred leader ----
 ```
 
-The preferred leader is the first one in the `Replicas` list. The leadership can change. These changes are triggered 
-by a few actions, and one of them is leader process shutdown. The graceful Kafka process shutdown unregisters the broker
-https://kafka.apache.org/35/documentation/#basic_ops_restarting
+The preferred leader is a one placed at the first position in the `Replicas` list. The leadership can change. These changes are triggered 
+by a few actions, and one of them is leader shutdown. During the graceful/controlled shutdown, the broker de-registers itself 
+from the controller by setting a special flag in heartbeat request. Then the controller removes the broker from any partition `ISR`,
+and elects new leader for partitions led by the broker. In the end, the controller commits this information to the metadata log. 
+The new leaders will eventually know about lead changes via 
+the metadata [propagation](#cluster-metadata) mechanism. The same way followers find out from which node to replicate partition's data. 
+And the same happens for clients too - they use metadata to discover new leaders. 
+
+// P11: TODO
+
+1. Followers (`Broker2`/`Broker3`) fetch from the `Broker1` being an old leader.  
+2. `Broker1` sends periodic `HeartbeatRequest` to the controller, to declare it is alive. Once it wants to shut down gracefully, 
+it set special flag `wantShutdown`.  
+3. The controller seeing this flag iterates over all partitions with `ISR` containing `Broker1`. Then it removes the broker from 
+the `ISR`, and if it was also a leader, elects a new one. Then it writes these changes to the metadata log.  
+4. `Broker2`/`Broker3` learns about the changes by observing the metadata log via periodic fetch requests from the controller.  
+5. Once `Broker3` detects a new leader it starts pulling from it.
+6. Now the `Broker1` can shut down.  
+
+Another reason for changing a leader is the current leader failure. The failed broker stops sending 
+heartbeat requests to the controller. Once the `broker.session.timeout.ms` passed, the controller removes the leader from 
+any partition's `ISR`, elects a new leader from the rest of the `ISR` and commits that change to the metadata log. 
+
+### Unclean leader election
+
+Consider a topic with a `replication.factor=4` and `min.in.sync.replicas=2` and single partition `A` for simplicity. 
+The current `ISR=2` for `A`, and we have two brokers with the performance degradation, so they end up outside the `ISR`. 
+The `ISR >= MinISR` condition is met, so any `ACK=1/all` produce requests work fine. Now, what happens when the 3rd broker 
+falls out of the `ISR` ?  
+1. The producers with `acks=all` gets errors because `ISR < MinISR`.  
+2. The `acks=1` still works fine.   
+3. The high watermark cannot progress because `ISR < MinISR`. No more message can be [committed](http://127.0.0.1:4000/2024-05-15-kafka-replication.html#consumers-message-visibility-watermark-and-committed-messages). 
+Because of that, consumers don't get any messages. 
+4. Effectively the partition is available for writes with ack leader, but not for reads.  
+
+What happens now when the current leader fails ? It was the last `ISR` replica. The leader election described so far 
+assumed that the next leader can be only selected from the `ISR` set (clean election) - but there are no more `ISR`. 
+The partition becomes completely unavailable. What choices do we have in this situation?
+1. We care about not losing committed data, and have to wait for at least one of the previous `ISR` replicas to become 
+available again. Which are these ? The last leader and the broker which failed before, because then the `ISR >= MinISR`. 
+This is a broad topic described as the [Eligible Leader Replica](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas). 
+2. We care about making the partition available even if it means losing some data. We still have 2 replicas which 
+were outside the `ISR` from the outset, and may not have all committed events. But at least there are alive, so we can 
+elect on of them as the new leader. We can enable this by setting [`unclean.leader.election.enable=true`](https://kafka.apache.org/documentation/#topicconfigs_unclean.leader.election.enable) 
+on a topic.  
 
 ### Availability vs consistency
 
-Setting all previously mentioned configurations:
+Setting all previously mentioned configurations requires understanding how they affect availability and consistency:
 
 * `acks` on a `KafkaProducer`
 * minimum in-sync-replicas (`min.in.sync.replicas`)
 * number of replicas (`replication.factor`) 
 * unclean leader election (`unclean.leader.election.enable`)
 
-requires understanding how they affect availability and consistency. Before doing anything, start with answering the question: do you 
+Before configuring anything, start with answering the question: do you 
 accept losing any data ? Do you accept that the produced message may never be delivered to the consumers even when Kafka responded 
 successfully during publishing ? Most of the time, Kafka will work fine, but you have to prepare for the hard times too:
 * broker disk failures
 * slow network
 * network partitions (some of the brokers cannot communicate with others)
-* broker ungraceful shutdowns
-* broker machine disasters
+* broker ungraceful shutdown
+* broker machine disaster
 
 What is more important when the above conditions arise ?
 
