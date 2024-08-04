@@ -26,7 +26,7 @@ across different machines (brokers). Partitions are a way to achieve scalability
 any of the partition in parallel. We'll cover it in a second. The messages are guaranteed to be read in the same order as 
 they were written within a *single topic partition*.    
 
-// TODO: obrazek z producerem publikującym na partycje i konsumującym (P1)
+![kafka-topics.png]({{site.baseurl}}/img/replication/kafka-topics.png)
 
 ### How many partitions 
 
@@ -60,7 +60,7 @@ can change depending on its availability. The producer publishes messages direct
 fetch messages from the leaders. Actually there is an option to consume from [followers](https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica), 
 but we do not consider this option here. 
 
-// TODO obrazek (P2)
+![replication-from-followers.png]({{site.baseurl}}/img/replication/replication-from-followers.png)
 
 When creating a topic we provide at least two basic parameters: `partitions` and `replication factor`. The former is
 a number of partitions a topic is divided to. The latter is a number of replicas for each partition. 
@@ -142,7 +142,7 @@ keeps cluster-wide metadata information on disk. The usual brokers learn about m
 Every admin change e.g. increasing the number of partitions in a topic goes to the controller. The controller 
 propagates the change to the usual brokers via metadata fetch API, and then clients fetch that metadata from the brokers.
 
-// P3 
+![metadata-protocol.png]({{site.baseurl}}/img/replication/metadata-protocol.png)
 
 On the picture above, the brokers use `FetchRequests` to get updates about metadata. Internally, metadata is a topic and 
 brokers use the existing API between them to fetch the newest metadata information. Producers and consumers on the other
@@ -218,7 +218,7 @@ global view of the partition would be like: `Replicas: [R1, R2, R2], Leader: R1,
 The question that comes to mind when thinking about replication is: when the consumers can see the published message ?
 The answer is: **when all in-sync replicas replicate the published message**. Let's investigate what that exactly means.
 
-// P5
+![committed-messages.png]({{site.baseurl}}/img/replication/committed-messages.png)
 
 The picture above contains a topic with a replication factor 3. The producer published 5 messages with offsets: `0,1,2,3,4`. 
 The messages `0,1,2` were already replicated by all current in-sync replicas. The messages `3,4` were replicated only by one 
@@ -345,82 +345,82 @@ is removed from the ISR of all its topic partitions. This implies losing leaders
 If the fenced broker is a leader for any partitions it handles, the controller performs leader election, and pick one of 
 the broker from the new ISR as a new leader. That information is then disseminated across cluster using metadata protocol 
 (from controller -> to other brokers -> and to clients). 
- 
-// P6 TODO
 
-The picture above shows the point in time when the current leader's broker stops sending heartbeats. The controller detects it
-and calculate the new cluster metadata.
+![failed-leader-heartbeat.png]({{site.baseurl}}/img/replication/failed-leader-heartbeat.png)
 
-// P7 TODO
+The picture above shows the point in time when the current leader's broker stops sending heartbeats [1]. The controller detects it
+and calculate the new cluster metadata [2].
+
+![controller-performs-leader-elections.png]({{site.baseurl}}/img/replication/controller-performs-leader-elections.png)
 
 The metadata then goes to the followers, so they can start fetching from the new leader. For picture clarity, I 
-purposely didn't draw metadata fetching requests from brokers to the controller. 
+purposely didn't draw metadata fetching requests from brokers to the controller and from consumer to the brokers. 
 
 2) The second party allowed to modify the partition's ISR (besides the controller) is a partition leader. 
-A replica which doesn't fetch any data or fetches it too slow, is removed from the ISR by a leader of the partition. The 
-leader sends then `AlterPartitionRequest` to the controller with the new proposed ISR. The controller saves/commits that 
-information in metadata, which is then spread across the cluster. 
+The leader removes slow or unavailable replicas from the ISR. It then sends the `AlterPartitionRequest` to the controller 
+with the new proposed ISR. The controller saves/commits that information in the metadata, which is then spread across the cluster. 
 
-// P8: TODO 
+![follower-cant-keep-up-to-leader.png]({{site.baseurl}}/img/replication/follower-cant-keep-up-to-leader.png)
 
-// TODO: opisać podobnie jak wcześniej
+Once the follower (Broker2) falls too far behind the leader [1], the leader removes it from the partition's ISR [2], 
+and sends the `AlterPartitionRequest` to the controller [3].
 
-// P9: TODO
+![leader-commits-metadata-throwing-follower-out-of-isr.png]({{site.baseurl}}/img/replication/leader-commits-metadata-throwing-follower-out-of-isr.png)
 
-// TODO: opisać podobnie jak wcześniej
+Then metadata gets around the rest of the brokers and clients.
 
 ### Expanding ISR
 
 Assuming the partition has a leader, adding a replica to the ISR can be only done by that current leader. Once the 
-out-of-sync replica caught-up to the leader's log it is added to the ISR by leader issuing the `AlterPartitionRequest` 
+out-of-sync replica caught-up to the end of the leader's log, it is added to the ISR by leader issuing the `AlterPartitionRequest` 
 to the controller. 
 What if there is no leader for partition ? It can be the case that all replicas for example restarted. In this 
-case the controller elects a leader and then saves that information in metadata (that will eventually go to the replicas). 
-The rest of the replicas will join the ISR by catching up to the leader. 
+case, the controller elects a leader and then saves that information in metadata (that will eventually go to the replicas). 
+The rest of the replicas will join the ISR by catching up to the new leader. 
 
 
 ###  Min-ISR (minimum in-sync-replicas) and AKCs (acknowledgements)
 
-You've probably heard that in a distributed systems world, sooner or later you will come across a choice between 
+In a distributed systems world, sooner or later you will come across a choice between 
 availability or consistency during failure scenarios. In Kafka, this choice is made by a collaboration of 
-both client - `KafkaProducer` and the Kafka broker itself. Until now, we've mentioned that the `KafkaProducer` just publishes 
+client - `KafkaProducer` and the Kafka broker itself. Until now, we've mentioned that the `KafkaProducer` just publishes 
 messages to the leader, then the replicas pull the messages, so they eventually end up on a few independent brokers. 
-We didn't specify when the producer should state that message was written to the topic:
+We didn't specify yet when the producer should state that message was written to the topic:
 1. When just the leader saves the message on a local machine without waiting for replication from the followers ? What if the 
 leader crashed a short time after acknowledging, but before the replication happens ?
 2. When all ISR replicas replicate the message ? We know, that the ISR is a curated list of currently available and healthy partition replicas. 
 We know it is dynamic. It can be even limited to the leader alone. It can be even empty!  
-3. When some minimal number of ISR confirms ? How many brokers should get the copy, so we consider it as safely replicated ? This 
+3. When some minimal number of ISR confirms ? How many brokers should get the copy, so we consider it safely replicated ? This 
 is what a kafka topic `min.in.sync.replicas` property configures. The documentation can be found [here](https://kafka.apache.org/documentation/#topicconfigs_min.insync.replicas).
 
-The Min-ISR tells the leader of the partition, for how many of the ISR (including itself) it should wait before 
+The Min-ISR tells the partition's leader, for how many of the ISR (including itself) it should wait before 
 giving the positive acknowledge response to the client. But this is not the end, I said that the `KafkaProducer` 
 participates in the decision-making process. That's why we have the following producer configuration: [acks](https://kafka.apache.org/documentation/#producerconfigs_acks).
 I recommend to reading the documentation, but in case you don't:
-1. `acks=0` - it is a fire and forget type of sending. We don't care about saving the message in Kafka. We assume most 
-of the time the cluster (and producing app) is working fine and most of the messages will survive. 
-2. `acks=1` - wait until the replica leader stores the message in a local log, and don't care if it was replicated 
+1. `acks=0` - it is a fire and forget type of sending. We don't care about saving the message in Kafka. We assume that most 
+of the time the cluster is working fine, and most of the messages will survive. 
+2. `acks=1` - wait until the replica leader stores the message in its local log, and don't care if it was replicated 
 by followers.
 3. `acks=all` - wait until message is written to the leader and all in-sync replicas. If the number of ISR 
 falls below Min-ISR the producer gets an error. 
 
-Note that in any case of `acks=0/1/all` the consumers see messages only after the message is committed. That means 
-that the leader waits for all current ISR to advance the HW (high watermark). We know that consumers see messages 
+Note that in any case of `acks=0/1/all`, the consumers see messages only after the message is committed. That means 
+that the leader waits for all current ISR to advance the high watermark, and we know that consumers see messages 
 only up to the HW. Additionally, if the condition `Min-ISR >= ISR` is not met, the watermark cannot advance. 
 So even if message was published with `ack=0/1`, it is available for consumers when all ISR replicated up to that 
 message offset and the number of ISR is at least Min-ISR. 
 
 ### How Kafka persists messages
 
-By default, Kafka broker does not flush the data directly to the non-volatile storage. It stores the
+By default, Kafka broker doesn't flush data directly to the disk storage. It stores the
 messages in the OS I/O memory - [page cache](https://en.wikipedia.org/wiki/Page_cache). 
-This can be controlled via `flush.messages`. 
+This can be controlled via `flush.messages` setting. 
 When set to `1` Kafka will flush every message batch to the disk and only then acknowledge it to the client. But then 
-you can see significant [drop in performance](https://www.confluent.io/blog/kafka-fastest-messaging-system/#fsync). 
-The recommendation it to leave the default config - thus not doing fsync. That means that message confirmed by the leader (`acks=1`) is not 
-necessarily written to disk. The same applies for `acks=all` - all `ISR` replicas confirmed only storing the message in the local OS page cache. 
+you can see a significant [drop in performance](https://www.confluent.io/blog/kafka-fastest-messaging-system/#fsync). 
+The recommendation it to leave the default config - thus not doing `fsync`. That means the message confirmed by the leader (`acks=1`) is not 
+necessarily written to disk. The same applies for `acks=all` - all `ISR` replicas confirmed by only storing the message in the local OS page cache. 
 
-// P10: TODO
+![page-cache.png]({{site.baseurl}}/img/replication/page-cache.png)
 
 The OS eventually flushes the pages from cache when it becomes full. The flushing also happens during the graceful OS shutdown. 
 Because of this asynchronous writing nature, the acknowledged, but not yet flushed messages can be lost when the broker 
@@ -428,13 +428,13 @@ experiences a sudden failure. Note, that the page cache is retained when the Kaf
 by the OS. The abrupt entire OS shutdown is something which can cause the data loss. 
 Leveraging the page cache provides improved response times and nice performance. But is it safe ? And why I'm talking about 
 it during the replication ? Kafka can afford asynchronous writing thanks to the usage of its replication protocol. 
-Part of it, is partition recovery. In the event of uncontrolled partition leader shutdown, where some of the messages may 
-have been lost (because done without fsync) the Kafka depends on the controller broker, which performs leader election for that partition. 
+Part of it, is partition recovery. In the event of uncontrolled partition's leader shutdown, where some of the messages may 
+have been lost (because done without `fsync`) the Kafka depends on the controller broker, which performs leader election for that partition. 
 The objective is to choose a leader with a complete log - the one from the current `ISR`. 
 
 ### Preferred leader and leader failover
 
-Each Kafka topic partition has a leader replica initially chosen by the controller during a topic creation. 
+Each Kafka topic's partition has a leader replica initially chosen by the controller during a topic creation. 
 I previously explained the algorithm for assignment the leaders to brokers. The leader assigned at the beginning is called 
 a preferred leader. It can be recognized by examining the output from kafka topic details.
 
@@ -452,21 +452,21 @@ Topic: test     TopicId: 2ZF_sUf2QjGHA5UJDFbY1g PartitionCount: 3       Replicat
 
 The preferred leader is a one placed at the first position in the `Replicas` list. The leadership can change. These changes are triggered 
 by a few actions, and one of them is leader shutdown. During the graceful/controlled shutdown, the broker de-registers itself 
-from the controller by setting a special flag in heartbeat request. Then the controller removes the broker from any partition `ISR`,
-and elects new leader for partitions led by the broker. In the end, the controller commits this information to the metadata log. 
-The new leaders will eventually know about lead changes via 
+from the controller by setting a special flag in heartbeat request. Then the controller removes the broker from any partition's `ISR`,
+and elects a new leaders for partitions previously led by this broker. In the end, the controller commits this information to the metadata log. 
+The new leaders will eventually know about the changes via 
 the metadata [propagation](#cluster-metadata) mechanism. The same way followers find out from which node to replicate partition's data. 
 And the same happens for clients too - they use metadata to discover new leaders. 
 
-// P11: TODO
+![clean-broker-shutdown.png]({{site.baseurl}}/img/replication/clean-broker-shutdown.png)
 
 1. Followers (`Broker2`/`Broker3`) fetch from the `Broker1` being an old leader.  
-2. `Broker1` sends periodic `HeartbeatRequest` to the controller, to declare it is alive. Once it wants to shut down gracefully, 
-it set special flag `wantShutdown`.  
+2. `Broker1` sends periodic `HeartbeatRequest` to the controller. Once it wants to shut down gracefully, 
+it sets a special `wantShutdown` flag.  
 3. The controller seeing this flag iterates over all partitions with `ISR` containing `Broker1`. Then it removes the broker from 
 the `ISR`, and if it was also a leader, elects a new one. Then it writes these changes to the metadata log.  
 4. `Broker2`/`Broker3` learns about the changes by observing the metadata log via periodic fetch requests from the controller.  
-5. Once `Broker3` detects a new leader it starts pulling from it.
+5. Once the `Broker3` detects a new leader, it starts pulling from it.
 6. Now the `Broker1` can shut down.  
 
 Another reason for changing a leader is the current leader failure. The failed broker stops sending 
@@ -475,46 +475,56 @@ any partition's `ISR`, elects a new leader from the rest of the `ISR` and commit
 
 ### Unclean leader election
 
-Consider a topic with a `replication.factor=4` and `min.in.sync.replicas=2` and single partition `A` for simplicity. 
-The current `ISR=2` for `A`, and we have two brokers with the performance degradation, so they end up outside the `ISR`. 
-The `ISR >= MinISR` condition is met, so any `ACK=1/all` produce requests work fine. Now, what happens when the 3rd broker 
-falls out of the `ISR` ?  
-1. The producers with `acks=all` gets errors because `ISR < MinISR`.  
-2. The `acks=1` still works fine.   
-3. The high watermark cannot progress because `ISR < MinISR`. No more message can be [committed](http://127.0.0.1:4000/2024-05-15-kafka-replication.html#consumers-message-visibility-watermark-and-committed-messages). 
-Because of that, consumers don't get any messages. 
-4. Effectively the partition is available for writes with ack leader, but not for reads.  
+Consider a topic with a `replication.factor=4`, `min.in.sync.replicas=2` and single partition `A` for simplicity. 
+The current partition `ISR=2`. We have two brokers (Broker2/Broker3) with the performance degradation, 
+so they end up outside the `ISR`. The `ISR >= MinISR` condition is met, so any `ACK=1/all` produce requests work fine. 
 
-What happens now when the current leader fails ? It was the last `ISR` replica. The leader election described so far 
+![performance-degradation-1.png]({{site.baseurl}}/img/replication/performance-degradation-1.png)
+
+Now, what happens when the 3rd broker (Broker4) crashed ?  
+1. The producers with `acks=all` gets errors because `ISR < MinISR`.  
+2. The `acks=1` still works fine.  
+3. The high watermark cannot progress because `ISR < MinISR`. No more messages can be [committed](http://127.0.0.1:4000/2024-05-15-kafka-replication.html#consumers-message-visibility-watermark-and-committed-messages). 
+Because of that, consumers don't get any new messages. 
+4. Effectively the partition is available only for writes with `acs=1`, but not for reads.  
+
+![performance-degradation-2.png]({{site.baseurl}}/img/replication/performance-degradation-2.png)
+
+What happens now when the current leader (Broker1) fails ? It was the last `ISR` replica. The leader election described so far 
 assumed that the next leader can be only selected from the `ISR` set (clean election) - but there are no more `ISR`. 
 The partition becomes completely unavailable. What choices do we have in this situation?
+
+![performance-degradation-3.png]({{site.baseurl}}/img/replication/performance-degradation-3.png)
+
 1. We care about not losing committed data, and have to wait for at least one of the previous `ISR` replicas to become 
-available again. Which are these ? The last leader and the broker which failed before, because then the `ISR >= MinISR`. 
-This is a broad topic described as the [Eligible Leader Replica](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas). 
-2. We care about making the partition available even if it means losing some data. We still have 2 replicas which 
+available again. Which are these ? The last leader and the broker which failed before (Broker1/Broker4), 
+because then the `ISR >= MinISR`. This is a broad topic described as the [Eligible Leader Replica](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas) 
+and it currently under development.  
+2. We care about making the partition available even if it means losing some data. We still have 2 replicas (Broker2/Broker3) which 
 were outside the `ISR` from the outset, and may not have all committed events. But at least there are alive, so we can 
 elect on of them as the new leader. We can enable this by setting [`unclean.leader.election.enable=true`](https://kafka.apache.org/documentation/#topicconfigs_unclean.leader.election.enable) 
 on a topic.  
 
 ### Availability vs consistency
 
-Setting all previously mentioned configurations requires understanding how they affect availability and consistency:
+Setting all previously mentioned configurations:
 
-* `acks` on a `KafkaProducer`
+* number of acknowledgements `acks`
 * minimum in-sync-replicas (`min.in.sync.replicas`)
 * number of replicas (`replication.factor`) 
 * unclean leader election (`unclean.leader.election.enable`)
 
-Before configuring anything, start with answering the question: do you 
-accept losing any data ? Do you accept that the produced message may never be delivered to the consumers even when Kafka responded 
-successfully during publishing ? Most of the time, Kafka will work fine, but you have to prepare for the hard times too:
+requires understanding how they affect availability and consistency. Before configuring anything, start with answering the 
+question: do you accept losing any data ? Do you accept that the produced message may never be delivered to the consumers 
+even when Kafka responded successfully during publishing ? Most of the time, Kafka will work fine, but you have to prepare 
+for the hard times too:
 * broker disk failures
 * slow network
 * network partitions (some of the brokers cannot communicate with others)
 * broker ungraceful shutdown
 * broker machine disaster
 
-What is more important when the above conditions arise ?
+What is more important to you when the above conditions arise ?
 
 **Availability** - being able to produce messages despite the fact that some of them may be permanently gone  
 **Consistency** - stop producing and throwing errors when there is not enough replicas to provide expected durability
@@ -529,28 +539,31 @@ stops despite successful writing.
 2. **lower `min.in.sync.replicas`** - as mentioned in the previous point, for `acks=1`, the `Min-ISR` does not affect producing, but will 
 always affect consuming. The consumers can only fetch committed messages. These are messages with offsets below the high watermark,
 replicated to at least `Min-ISR` number of brokers (the high watermark progression depends on condition `ISR >= Min-ISR`). 
-While higher `Min-ISR` puts a restriction (and delay) on a consuming process, it also increases predictability for consumers. They get 
-messages only once they are stored on multiple machines. For example, reprocessing the same topic multiple times, interleaved with the 
-failure conditions in the meantime, results in a more consistent view of messages. 
+> Before blindly just setting it to 1, note that while higher `Min-ISR` puts a restriction (and delay) on a consuming process, 
+> it also increases predictability for consumers. They get
+> messages only once they are stored on multiple machines. For example, reprocessing the same topic multiple times, interleaved with the
+> brokers failure in the meantime, results in a more consistent view of messages.
 If you want to use `acks=all`, lowering `min.in.sync.replicas` will increase the producing availability as well. 
-3. **higher `replication.factor`** - the more replicas you have, the more of them can serve as the `ISR`. For `ack=1` higher 
+3. **higher `replication.factor`** - the more replicas you have, the more of them can serve as the `ISR`. For `ack=1`, higher 
 number of `ISR` means broader choice of the valid replica during leader failover. For `acks=all`, more `ISR` means greater chances 
-that `ISR >= MIN-ISR` while some of the replicas are unavailable. However, when nodes are healthy, more replicas causes waiting for a higher 
-number of `ISR` replicas before committing the message. And obviously, brokers has more work to do because of replication. 
+that `ISR >= MIN-ISR` while some of the replicas are unavailable. However, when all nodes are healthy (thus are in `ISR`), 
+more replicas means waiting for a higher number of `ISR` replicas before committing the message. And obviously, brokers has 
+more work to do because of replication. 
 4. **unclean.leader.election.enable** set to `true` - when the subset of nodes with a complete committed data (`ISR`) failed, you 
 favor electing not up-to-date (outside of `ISR`), but alive node as the leader, rather than waiting for one of the `ISR` to recover. 
 
 **Consistency**
-1. **`acks=all`** - leader waits for all replicas in current `ISR` before acknowledging to the client. If `ISR < MinISR` then 
-return errors. The visibility for consumers and high watermark progression is the same as for `acks=1`
+1. **`acks=all`** - leader waits for all replicas in the current `ISR` before acknowledging to the client.  
+If `ISR < MinISR` then it
+returns errors. The visibility for consumers and high watermark progression is the same as for `acks=1`
 2. **higher `min.in.sync.replicas`** - should be lower than `replication.factor` to have some space for availability as well 
 3. **higher `replication.factor`** - same as in the availability section 
 4. **unclean.leader.election.enable** set to `false` - only replicas with a complete committed log (`ISR`) can become a leader. 
-When no currently available, the whole partition is nonfunctional, but will not lose data (when one of the `ISR` recovers).
+When no currently available, the whole partition is nonfunctional, but will not lose data (when at least one of the `ISR` recovers).
 
 ### Performance 
 
-We graded different configurations in terms of availability and consistency, but they have also impact on performance:  
+We graded different configurations in terms of availability and consistency, but they have impact on the performance as well:  
 1. **`acks=1`** - causes better write latency as the leader doesn't wait for all `ISR` to confirm messages. The consumer 
 still has to wait for full `ISR`.
 2. **`acks=all`** - increased write latency. On consumers side nothing changes.
@@ -569,14 +582,15 @@ The `unclean.leader.election.enable` is `false`.
 
 1. **`replication.factor=4`, `min.in.sync.replicas=3`, `acks=all`** - this config provides high consistency at the cost of 
 availability and write latency. Each message is replicated to **at least** 3 brokers (including leader) before getting success response. 
-During the healthy brokers condition, the `ISR=4`, so `ack=all` will wait for all 4 brokers. One of the brokers can 
-fail (`ISR=3`), and we still have `ISR >= Min-ISR` condition met, so we still can produce messages. Losing one more broker 
-(`ISR=2`) affects availability, as the `ISR >= Min-ISR` won't apply anymore. When the `ISR=3` and the partition is still available 
-for writes, it can survive up to 2 further replicas failures without losing data.   
-In such an extreme situation, there still would be one node with a complete *committed* log, which would be elected as 
-the leader, so rest of the brokers could replicate from it after recovery. In a common scenario (`ISR=4`) we would 
-survive up to 3 replicas crashes. To sum up: we can tolerate up to 1 broker crashes while still being available for writes, 
-and then 2 concurrent (`Min-ISR - 1`) failures without losing data.  
+During the healthy broker's conditions, the `ISR=4`, so `ack=all` will wait for all 4 brokers. One of the brokers can 
+fail (`ISR=3`), and we still have `ISR >= Min-ISR` condition met, so we still will be able to produce new messages. 
+Losing one more broker (`ISR=2`) affects availability, as the `ISR >= Min-ISR` won't apply anymore.  
+When the `ISR=3`, and the partition is still available 
+for writes, it can survive up to 2 further replicas failures without losing data. In such an extreme situation, there still would be one node with a complete *committed* log, which would be elected as 
+the leader, so rest of the brokers could replicate from it after the recovery.  
+In a more common scenario, (`ISR=4`) we would survive up to 3 replicas crashes.  
+To sum up: we can tolerate up to 1 broker crashes while still being available for writes, 
+and then 2 (`Min-ISR - 1`) failures without losing data.  
 2. **`replication.factor=4`, `min.in.sync.replicas=2`, `acks=all`** - moderate consistency and availability. We can tolerate 
 up to 2 unhealthy replicas while providing availability, but then we can lose only one additional partition (`Min-ISR - 1`) 
 without losing data.  
@@ -584,61 +598,39 @@ without losing data.
 responds successfully after storing messages in its local log, before replication to the rest of the `ISR` happens. 
 By using this configuration, you accept the possibility of losing some events. The lost are those acknowledged by the leader,
 but still not replicated by the `ISR` - which is a non-committed part of the log. The reality is that you can lose messages in more scenarios 
-than just leader failure. As the author of series [posts](https://jack-vanlightly.com/blog/2018/9/14/how-to-lose-messages-on-a-kafka-cluster-part1) 
+than just leader failure. As the author of the [post](https://jack-vanlightly.com/blog/2018/9/14/how-to-lose-messages-on-a-kafka-cluster-part1) 
 shows, the networking problems are even worse (the post investigates Kafka with Zookeeper). Nevertheless, once we accept the possibility of occasional data loss, 
-we get very high availability: we can run even without 3 brokers. Note that the consumers will see the data once it is 
-replicated by the `Min-ISR=2`.  
+we get very high availability: we can run even without 3 brokers. Note that consumers will see data once it is 
+replicated by at least `Min-ISR=2` brokers.  
 4. **`replication.factor=4`, `min.in.sync.replicas=1`, `acks=all`** - we favor availability over consistency in case of emergency,
 but when the cluster is healthy, we want to replicate to a higher number of replicas - current `ISR`. 
 When all replicas perform well, the `ISR=4`, and leader will acknowledge events when all `ISR` replicate.
-The messages are then available for consumers after replication to the full `ISR=4`. But, in case of emergency, the `ISR` can even 
+The messages are then available for consumers after replication to the full `ISR=4`. In case of emergency, the `ISR` can even 
 shrink to the leader itself, and we still be able to produce/consume (because of `Min-ISR=1`).
 This may seem like a non-practical scenario: why to enforce higher consistency when everything goes well, but when not, 
 just forget about safety and accept losing data ? Compared to any `acks=leader` configuration, this will be more reliable during 
-leader restarts. For example, the leader rebooted ungracefully, the rest of the `ISR` was fine in that time. The leader 
-could acknowledge some messages before the restart, by writing them to the page cache, which is not synchronized immediately to disk. 
+leader restarts.  
+For example, consider a scenario when the leader rebooted ungracefully, and the rest of the replicas was fine at that time. The leader 
+could acknowledge some messages before the restart, by writing them to the page cache, which is not immediately synchronized to disk. 
 If the producing was made with `acks=leader`, the leader didn't wait for `ISR` before acknowledging, which when followed by the 
 shutdown could end up with a data loss. But in our case, the producer used `acks=all`. The leader waited for all current `ISR` 
 before acknowledging. This means that the new leader from the current `ISR` had to have all acknowledged messages - no data loss.
 
+### Conclusions
 
-
-
-
-
-
-
-
-
-
-
-
-
-// TODO: Partitions vs availability - does the completely failed partition appears in producer metadata ?  -> yes
-// TODO: what about ELR ? maybe just add information at the end
-
-1. How many concurrent failures we can survive with `min.in.sync.replicas` set to X and ACK all?
-2. How many concurrent failures we can survive with `min.in.sync.replicas` set to X and ACK leader?
-3. What is the availability of the system with `min.in.sync.replicas` set to X and ACK all?
-4. What is the availability of the system with `min.in.sync.replicas` set to X and ACK leader?
-
-Let's take the following non-functional requirements that we want for application producing to Kafka to fulfill:
-1. [Durability] The data should be replicated to 4 replicas.
-2. [Consistency] No message should be lost after it has been saved and acknowledged by Kafka. We should survive
-3. [Availability] In the failure conditions the producing should be highly available. We should survive up to 2 failed replicas
-   and still be able to produce.
-
-We've created a topic:
-```postgresql
-TopicA - partitions: 1 (one partition P1 for simplicity), replication factor: 4 (leader and 3 followers)
-leader = R1
-replicas = [R1, R2, R3, R4]
-ISR (in-sync replicas) = [R1, R2, R3, R4]
-```
-
-Now let's collate the configuration with the requirement:
-1. OK, we have a topic :)
-2. OK, the data is replicated to 4 replicas. If they are all healthy, they can keep up with replication. They all are
-   in-sync (ISR = [R1, R2, R3, R4])
-3. OK, if 
-
+While we've covered a lot of replication stuff, it is still tip of the iceberg. There are plenty of mechanisms that Kafka 
+implements to provide safety, availability and good performance. My focus was on providing necessary information for making 
+conscious decisions while configuring Kafka topics and clients. In case you are interested in discovering the lower parts 
+of this iceberg, I recommend to read the following materials:
+1. Kafka replication [documentation](https://kafka.apache.org/documentation/#replication).   
+2. [Kafka improvement proposal](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas) 
+(actually in progress) enhancing replication correctness.  
+3. Really interesting (and detailed) [set of posts](https://github.com/Vanlightly/kafka-tlaplus/tree/main/kafka_data_replication/kraft/kip-966/description) about internals of Kafka replication.  
+4. [Series of blog posts](https://jack-vanlightly.com/blog/2018/9/14/how-to-lose-messages-on-a-kafka-cluster-part1) about scenarios when Kafka 
+can lose messages (these are for Kafka version before introducing KRaft controller).  
+5. A [talk](https://www.confluent.io/en-gb/kafka-summit-sf18/hardening-kafka-replication/) describing how hard it was to implement safe Kafka replication protocol. The author says about different mechanisms 
+preventing from losing messages.  
+6. Replication for Kafka control plane - [KRaft](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum). 
+We talked about replication between usual brokers, but avoided discussion about replication between Kafka controller nodes.  
+7. [Why Kafka does not need fsync to be safe](https://jack-vanlightly.com/blog/2023/4/24/why-apache-kafka-doesnt-need-fsync-to-be-safe).  
+8. And of course Apache Kafka [Github repository](https://github.com/apache/kafka/tree/trunk). 
