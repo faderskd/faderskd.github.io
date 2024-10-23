@@ -1,0 +1,9 @@
+title KafkaProducer send()
+
+
+ClientApp->KafkaProducer:Future<RecordMetadata> send(ProducerRecord p)
+KafkaProducer->KafkaProducer:for i in interceptors { \n    i.onSend(ProducerRecord p)\n}
+KafkaProducer->KafkaProducer: waitForMetadata(timeout) {\n    metadata.add(p.topic)\n    val version = requestUpdateForNewTopics()\n    sender.wakeup() \n    metadata.awaitUpdate(version)\n}
+KafkaProducer->KafkaProducer: val key = serializeKey()\nval value = serializeValue()\n
+KafkaProducer->KafkaProducer: calculatePartition() {\n     val partition = maybeGetFromRecord(p) || \n     maybeGetFromCustomPartitioner(p) || \n     maybeCalculateFromKeyUsingMurmurHash(p) ||\n     UNKNOW_PARTITION\n }
+KafkaProducer->KafkaProducer: appendRecordToAccumulator() {\n    \n}
