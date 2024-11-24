@@ -129,8 +129,44 @@ This is how `send()` works:
 1. Based on the `topic`, the producer knows where (to which brokers) it has to send data.   
 2. **Serializing** `key` and `value`. Kafka doesn't care about the type of the key and value. All its wants is the array of bytes. 
 The key is used in partitioning (more about that in a moment), and the value is the actual message.  
-3. **Partitioning**. If the partition is specified, the producer will send the message to the lider of that partition. Use 
-this option if you somehow calculated the partition before. Any use cases??????? #TODO
+3. **Partitioning**
+   1. If the partition is specified upfront, the producer will send the message to the leader of that partition. Usage of this
+      option involves calculating the partition before sending. 
+   2. If not, the producer will look for a [custom partitioner](https://kafka.apache.org/documentation/#producerconfigs_partitioner.class) 
+      provided by a configuration `props.setProperty(PARTITIONER_CLASS_CONFIG, CutomPartitioner.class.getName())`.
+   3. If partitioner class is not provided and the key is present the producer will calculate the partition on its own using
+      algorithm like: `hash(key) % numPartitions`. 
+   4. If the custom partitioner and the key are not present the partition is chosen using one of the available load balancing 
+      strategies. And here we have a few choices too. We will cover that in a later section dedicated to a detailed 
+      `send()` method explanation.
+4. **Batching**
+   1. Instead of sending each message separately the producer will batch messaged for each partition. This will increase 
+      throughput as we save on the network round trips times (number of request/response cycles). But obviously, we don't 
+      to want indefinitely wait for a batch to fill so we have to trade-off between the batch size and the cutoff time. 
+   2. The [batch size](https://kafka.apache.org/documentation/#producerconfigs_batch.size) control how many **bytes** we can send 
+      to a single partition. Note that this is not a request size sent to the broker, because the broker owns multiple partitions
+      (more about internals later). Default value is 16KB. The configuration of this value should be tested in your specific case. 
+      Too small size will increase the number of requests, and decreasing throughput. Too big size will not affect maximum 
+      wait time as we have another configuration for that. But it affects memory usage distribution inside the producer. 
+      More about this in points 4 and 5. 
+   3. [linger.ms](https://kafka.apache.org/documentation/#producerconfigs_linger.ms) is the maximum time the producer will wait 
+      for the batch to fill. If the batch is not full after that time, it will be sent anyway. This will protect from 
+      unpredictable latencies in case the batches are not full. The default value is 0 which means disabled batching. The 
+      reality is that `linger.ms=0` may still batch in an application with high sending throughput. More about it later. 
+   4. [buffer.memory](https://kafka.apache.org/documentation/#producerconfigs_buffer.memory) is the maximum memory the producer 
+      can use to for messages waiting to be sent. The default value is 32MB. The producer has a memory pool that is given 
+      to batches to each partition. Each time a new batch is created/sent the memory is subtracted/reclaimed to this pool.
+      If you run out of that memory the producer will block the application calling `send()` until some memory is freed.
+   5. How to set these parameters correctly?
+      - start with defining requirements for throughput and latency
+      - if you don't care about latency so much you can set larger `batch.size` and `linger.ms` to increase throughput
+      - if you care about latency, set `linger.ms` to limit the maximum batching time
+      - if your app has low throughput, setting too large `batch.size` and too small `linger.ms` may end up 
+        in sending mostly empty batches, but each batch consumes constant memory (`batch.size`) from a memory pool 
+        which is not reclaimed until the batch is sent. Running out of memory will block the producer until memory is freed
+      - but you have to measure it in the end and adjust the parameters accordingly. We will cover that in a later section.
+        
+   
 
 ##### ACKS
 
