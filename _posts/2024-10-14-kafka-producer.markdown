@@ -159,14 +159,44 @@ The key is used in partitioning (more about that in a moment), and the value is 
       If you run out of that memory the producer will block the application calling `send()` until some memory is freed.
    5. How to set these parameters correctly?
       - start with defining requirements for throughput and latency
+      - then measure them with different configurations, remembering about below trade-offs (more about metrics later)
       - if you don't care about latency so much you can set larger `batch.size` and `linger.ms` to increase throughput
       - if you care about latency, set `linger.ms` to limit the maximum batching time
       - if your app has low throughput, setting too large `batch.size` and too small `linger.ms` may end up 
-        in sending mostly empty batches, but each batch consumes constant memory (`batch.size`) from a memory pool 
+        in sending mostly empty batches. Each batch consumes constant memory (`batch.size`) from a memory pool 
         which is not reclaimed until the batch is sent. Running out of memory will block the producer until memory is freed
-      - but you have to measure it in the end and adjust the parameters accordingly. We will cover that in a later section.
-        
-   
+      - monitor the batching so you can react accordingly - this will be covered in the monitoring section.
+5. **Sending**
+   1. Once we have batches ready to sent, the producer send them to the respective brokers. It will basically take a bunch of 
+   ready batches, check their partitions, find the leaders of that partitions, and group them by those leaders. The result 
+   is a map of   
+   `{ broker -> [batchesToSendForThatBroker] }`:
+   ```java
+   {
+     broker1 -> [batch1, batch2],
+     broker2 -> [batch3, batch4],
+     ...
+   }
+   ```
+   2. The producer will then make a `ProduceRequest([list of batches])` to each broker.
+   3. And now is time for more configuration options.
+   4. [acks](https://kafka.apache.org/documentation/#producerconfigs_acks) - controls how many replicas must acknowledge 
+   the record before the producer considers the record as sent. I'll stick with the DRY principle this time and really 
+   encourage you to read my post about [Kafka replication]({% post_url 2024-05-15-kafka-replication %}) before.
+   It deeply explains how replication works in Kafka and how the `acks` affects the producer's behavior in different 
+   scenarios.
+   6. [delivery.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_delivery.timeout.ms)
+   5. [max.request.size](https://kafka.apache.org/documentation/#producerconfigs_max.request.size)
+   5. [retries](https://kafka.apache.org/documentation/#producerconfigs_retries)
+   8. [request.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_request.timeout.ms)
+   7. [max.block.ms](https://kafka.apache.org/documentation/#producerconfigs_max.block.ms)
+   8. [enable.idempotence](https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence)
+   ![kafka-timeline-vs-timeouts.png]()
+
+
+ # example with batching
+ # example metrics
+ # exmaple of measuring e2e latency
 
 ##### ACKS
 
