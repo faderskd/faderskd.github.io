@@ -178,32 +178,32 @@ The key is used in partitioning (more about that in a moment), and the value is 
      ...
    }
    ```
-   1. The producer will then make a `ProduceRequest([list of batches])` to each broker.
-   2. And now is right time for more configuration options.
-   3. [acks](https://kafka.apache.org/documentation/#producerconfigs_acks) - controls how many replicas must acknowledge 
+   2. The producer will then make a `ProduceRequest([list of batches])` to each broker.
+   3. And now is right time for more configuration options.
+   4. [acks](https://kafka.apache.org/documentation/#producerconfigs_acks) - controls how many replicas must acknowledge 
    the record before the producer considers the record as sent. I'll stick with the DRY principle this time and really 
    encourage you to read my post about [Kafka replication]({% post_url 2024-05-15-kafka-replication %}). 
    It deeply explains how replication works in Kafka and how the `acks` affects the producer's behavior in different 
    scenarios.
-   4. [delivery.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_delivery.timeout.ms) - it is the total 
+   5. [delivery.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_delivery.timeout.ms) - it is the total 
    time for delivery of the record, after calling (and returning from) `send()` method. Look at the diagram below to see the 
    full message timeline. It contains time for batching, sending, waiting for response and retries.
-   5. [max.request.size](https://kafka.apache.org/documentation/#producerconfigs_max.request.size) - as you saw previously, 
+   6. [max.request.size](https://kafka.apache.org/documentation/#producerconfigs_max.request.size) - as you saw previously, 
    the request contains a list of batches. Beside that there is some metadata attached to each request. 
    This configuration controls the maximum size of bytes send over the network to a single broker. The default value is 1MB.
-   6. [retries](https://kafka.apache.org/documentation/#producerconfigs_retries) - the number of retries the producer will 
+   7. [retries](https://kafka.apache.org/documentation/#producerconfigs_retries) - the number of retries the producer will 
    make before giving up sending the request. This applies only to retryable errors like network issues, transient broker 
    problems, stale metadata, etc. You can achieve the same effect by disabling retries and handle each error on your own 
    when you get error from the `send()` future. In practice however, let leave its default value of `INTEGER.MAX_VALUE` and 
    configure just `delivery.timeout.ms`. It will stop sending after a configured timeout. 
-   7. [request.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_request.timeout.ms) - how much time to wait 
+   8. [request.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_request.timeout.ms) - how much time to wait 
    for a response from the broker. If the broker doesn't respond in that time, the producer will retry the request. 
-   8. [max.block.ms](https://kafka.apache.org/documentation/#producerconfigs_max.block.ms) - before `send()` method 
+   9. [max.block.ms](https://kafka.apache.org/documentation/#producerconfigs_max.block.ms) - before `send()` method 
    returns it has to have enough space for appending the record to the batch. If the current batch is full (or there is no batch
    for a specific partition) the producer has to allocate memory for a new batch. If there is no memory available (because 
    of `buffer.memory` limit), the producer will wait until another batch is sent and memory is freed. Another case when this method
    blocks is when sending to a topic which the producer has no metadata for. The producer will block until metadata is fetched.
-   9. [enable.idempotence](https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence) - config enabling 
+   10. [enable.idempotence](https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence) - config enabling 
    protection from duplicates in case of retries. The simple example of duplicated message is when a producer 
    sends message, the brokers processes it, saves it to the log, and just before returning the response to the producer, the producer times out 
    because of `request.timeout.ms`. The retry will happen but the broker already saved the message. This config prevents from 
@@ -211,7 +211,6 @@ The key is used in partitioning (more about that in a moment), and the value is 
    `acks=all` is not always a case. By default, the idempotence is enabled, but only if there are no conflicting configs. So for 
    example if you configure `acks=1` the producer will disable idempotence. 
    For explanation how it internally works see **Idempotent Producer** chapter in [Kafka transactions post]({% post_url 2024-02-21-kafka-transactions %}).
-
 
 And these are the most important configurations for the producer. Obviously there are many more, but they are more advanced 
 are configured much less frequently. We will cover few of them when touching some internals of the producer later.  
