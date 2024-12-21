@@ -29,8 +29,6 @@ but also some interesting internals.
 
 ### KafkaProducer basic config and usage
 
-#### Basic Configuration and usage
-
 We'll start with something really simple. This is the bare minimum configuration and the simplest usage. 
 Don't get this tiny example seriously - this code sucks, but we'll improve it later. 
 
@@ -102,7 +100,7 @@ produced message - topic, partition, offset, timestamp, etc. The `Future.get()` 
 This is just a tiny example, use it rather for local debugging than anything else. To get to production-like usage we have to 
 cover a lot of stuff. 
 
-#### KafkaProducer send() 10000 foot view
+### KafkaProducer send() 10000 foot view
 
 The above configuration is a toy starting point, and it needs a lot of improvements. There are tons of different knobs that 
 can be adjusted in the producer. We'll cover the most important ones while explaining how the `send()` method works. 
@@ -128,7 +126,8 @@ Each of these fields you can provide while constructing the producer record, and
 This is how `send()` works:
 1. Based on the `topic`, the producer knows where (to which brokers) it has to send data.   
 2. **Serializing** `key` and `value`. Kafka doesn't care about the type of the key and value. All its wants is the array of bytes. 
-The key is used in partitioning (more about that in a moment), and the value is the actual message.  
+The key is used in partitioning (more about that in a moment), and the value is the actual message. Implementing a custom 
+serializer is easy - just implement the `org.apache.kafka.common.serialization.Serializer` interface. 
 3. **Partitioning**
    1. If the partition is specified upfront, the producer will send the message to the leader of that partition. Usage of this
       option involves calculating the partition before sending. 
@@ -163,7 +162,7 @@ The key is used in partitioning (more about that in a moment), and the value is 
       - if you don't care about latency so much you can set larger `batch.size` and `linger.ms` to increase throughput
       - if you care about latency, set `linger.ms` to limit the maximum batching time
       - if your app has low throughput, setting too large `batch.size` and too small `linger.ms` may end up 
-        in sending mostly empty batches. Each batch consumes constant memory (`batch.size`) from a memory pool 
+        in sending mostly empty batches. Additionaly, each batch consumes constant memory (`batch.size`) from a memory pool 
         which is not reclaimed until the batch is sent. Running out of memory will block the producer until memory is freed
       - monitor the batching so you can react accordingly - this will be covered in the monitoring section.
 5. **Sending**
@@ -221,7 +220,7 @@ Because we've covered a lot of timeouts let's visualize the message timeline to 
 
  ![send-timeline.png]({{site.baseurl}}/img/producer/send-timeline.png)
 
-#### Parameters tuning
+### Parameters tuning
 
 Kafka comes with a useful tool `kafka-producer-perf-test.sh` that can be used to measure the producer's throughput and latency. 
 We can easily how different configurations affect the producer's performance. Let's check this out, and then we try to get similar 
@@ -232,17 +231,26 @@ Instructions setup Kafka cluster and CLI tool:
 2. Run `docker-compose up`.
 3. Download Kafka binaries https://kafka.apache.org/downloads (Kafka `3.8.1`).
 4. Unpack and go to the `bin` directory.
-5. Then create a topic with 3 partitions, replication factor 3 and 2 MinISR.
+5. Then create a topic with 3 partitions and replication factor 3
 ```postgresql
- ./kafka-topics.sh --create --topic userActivity --bootstrap-server localhost:9092 --replication-factor 3 --partitions 3 --config min.insync.replicas=2
+ ./kafka-topics.sh --create --topic userActivity --bootstrap-server localhost:9092 --replication-factor 3 --partitions 3
 ```
-6. I'm additionally using [toxiproxy](https://github.com/Shopify/toxiproxy?tab=readme-ov-file#1-installing-toxiproxy) 
+6. The resulting setup is
+```postgresql
+./kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic=userActivity
+Topic: userActivity     TopicId: VXPhD3_zRE6WBMr1RI7NYg PartitionCount: 3       ReplicationFactor: 3    Configs: segment.bytes=1073741824
+        Topic: userActivity     Partition: 0    Leader: 2       Replicas: 2,3,4 Isr: 2,3,4      Elr:    LastKnownElr: 
+        Topic: userActivity     Partition: 1    Leader: 3       Replicas: 3,4,1 Isr: 3,4,1      Elr:    LastKnownElr: 
+        Topic: userActivity     Partition: 2    Leader: 4       Replicas: 4,1,2 Isr: 4,1,2      Elr:    LastKnownElr: 
+```
+7. I'm additionally using [toxiproxy](https://github.com/Shopify/toxiproxy?tab=readme-ov-file#1-installing-toxiproxy) 
 for simulating network latency as I'm running everything on my local machine and network latency is just unrealistically low. 
 In the repository there is a `toxiproxy.json` file defining proxy configuration for kafka brokers. So start a server in one terminal.
 ```postgresql
 toxiproxy-server -config toxiproxy.json
 ```
-7. Add latency for the brokers. This will add 100[+/-50]ms of latency to each broker.
+7. Add latency for the brokers. This will add 100[+/-50]ms of latency to each broker. The same setup for brokers and 
+latency is used in this and all further examples.
 ```postgresql
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka1
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka2
@@ -347,14 +355,14 @@ the request size is almost the same as batch size:
 
 ```postgresql
 records-per-second = request-rate * request-size-avg / record_size 
-records-per-second = request-rate * batch_size / record_size 
+records-per-second = request-rate * batch_size-avg / record_size 
 ```
 
 we also know the formula for `request-rate` so we can substitute it to the above equation:
 
 ```postgresql
-records-per-second = request-rate * batch_size / record_size
-records-per-second = (1000 / request-latency-avg) * batch_size / record_size
+records-per-second = request-rate * batch_size-avg / record_size
+records-per-second = (1000 / request-latency-avg) * batch_size-avg / record_size
 ```
 
 To increase the number of records sent, and get rid of queuing we can: decrease the request latency or increase the batch 
@@ -380,7 +388,7 @@ producer-metrics:request-size-avg:{client-id=perf-producer-client}              
 producer-topic-metrics:record-send-rate:{client-id=perf-producer-client, topic=userActivity}   : 19645.206
 ```
 
-As you see despite increasing the batch size the latency didn't change. The queuing time is also lower. The rate of 
+As you see despite increasing the batch size the request latency didn't change. The queuing time is also lower. The rate of 
 records send (throughput) is higher. We can go further and try to increase the batch size even more. Let's set it to 
 2^18 = 262144 bytes. What's more I'll restore previous delivery/request timeout because our initial requirement was 
 that message should be published up to 10s. I'll also send 20M messages as in the first failed try. 
@@ -420,25 +428,225 @@ it would look like differently. The goal was to show the approach to tuning the 
 By the end of this post we'll cover more advanced ways of improving the producer's performance. But we'll need to 
 understand much more about its internals :)
 
-#TODO: obrazek dla powyższego przykładu
+### Kafka producer improved usage
 
+It's time to improve our first producer code sample. We'll add some more configurations, and we'll try to make it more 
+robust by using async sending. The goal is to get similar results as in performance test tool:
 
-
-
-
-
-
-
-
-
-
-
-# Full example
-
-1. Expected throughput: 1MB/s per topic
-2. Max latency: 500ms (from send to callback). This we can measure on our own.
-3. 
+```postgresql
+20000000 records sent, 153622.809915 records/sec (29.30 MB/sec), 1015.29 ms avg latency, 1263.00 ms max latency, 1017 ms 50th, 1127 ms 95th, 1168 ms 99th, 1225 ms 99.9th.
 ```
+* sending 20M records
+* each record size is 200 bytes
+* with throughput ~150K records/sec
+* with p99 delivery latency ~1.2s
+
+```java
+public class AsyncAuditProducer implements ProgramLoop {
+    private final static Logger logger = LoggerFactory.getLogger(AsyncAuditProducer.class);
+    private final static Random random = new Random();
+    private final static String AUDIT_TOPIC = "userActivity";
+
+    private volatile boolean running = true;
+    private final AtomicInteger sentCounter = new AtomicInteger(0);
+    private final Timer timer;
+    private final KafkaProducer<byte[], byte[]> producer;
+    private long lastReportMillis = System.currentTimeMillis();
+
+    public AsyncAuditProducer() {
+        this.producer = new KafkaProducer<>(producerProperties());
+        MeterRegistry meterRegistry = new SimpleMeterRegistry();
+        timer = Timer
+                .builder("send.latency")
+                .publishPercentiles(0.99)
+                .register(meterRegistry);
+    }
+
+    private static Properties producerProperties() {
+        Properties props = new Properties();
+        // required parameters
+        props.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9292,localhost:9393,localhost:9494,localhost:9595");
+        props.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        props.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+
+        // batching
+        props.setProperty(ProducerConfig.LINGER_MS_CONFIG, "0");
+        props.setProperty(ProducerConfig.BATCH_SIZE_CONFIG, "262144"); // 256KB
+
+        // sending
+        props.setProperty(ProducerConfig.ACKS_CONFIG, "1"); // only leader confirms
+        props.setProperty(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "10000"); // 10s
+        props.setProperty(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "5000"); // 5s
+        props.setProperty(ProducerConfig.MAX_BLOCK_MS_CONFIG, "1000"); // 1s
+
+        return props;
+    }
+
+    @Override
+    public void start() {
+        try {
+            long startMillis = System.currentTimeMillis();
+            while (running) {
+                try {
+                    byte[] payload = generatePayload(200);
+                    ProducerRecord<byte[], byte[]> record =
+                            new ProducerRecord<>(AUDIT_TOPIC, payload);
+
+                    long sendTime = System.currentTimeMillis();
+
+                    producer.send(record, (metadata, exception) -> {
+                        if (exception != null) {
+                            logger.error("Error while sending audit event", exception);
+                        } else {
+                            timer.record(System.currentTimeMillis() - sendTime, TimeUnit.MILLISECONDS);
+                            sentCounter.incrementAndGet();
+                            reportMetrics(startMillis);
+                        }
+                    });
+                    if (sentCounter.get() >= 20000000) {
+                        break;
+                    }
+                } catch (Exception ex) {
+                    logger.error("Error while sending audit event", ex);
+                }
+            }
+        } finally {
+            producer.close();
+            logger.info("Closing producer...");
+        }
+    }
+
+    private void reportMetrics(long startMillis) {
+        // report metrics every 3s
+        if (System.currentTimeMillis() - lastReportMillis > 3000) {
+            lastReportMillis = System.currentTimeMillis();
+            double throughput = 1000 * ((double) sentCounter.get() / (System.currentTimeMillis() - startMillis));
+            logger.info("------------------------- Reporting metrics --------------------------------------");
+            String throughputMsg = String.format("Send %dK messages. Throughput: %.2f records/s", sentCounter.get() / 1000, throughput);
+            logger.info(throughputMsg);
+            Arrays.stream(timer.takeSnapshot().percentileValues()).forEach(
+                    percentile -> logger.info(
+                            "Percentile {} : {}", percentile.percentile(), percentile.value(TimeUnit.MILLISECONDS))
+            );
+        }
+    }
+
+    @Override
+    public void wakeup() {
+        logger.info("Program loop wakeup");
+        running = false;
+    }
+
+    private static byte[] generatePayload(int length) {
+        byte[] payload = new byte[length];
+        for (int i = 0; i < length; i++) {
+            // ASCII A-Z
+            payload[i] = (byte) (random.nextInt(26) + 65);
+        }
+        return payload;
+    }
+}
+```
+
+Results:
+```postgresql
+...
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 18436K messages. Throughput: 153268.10 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 633.339904
+
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 18872K messages. Throughput: 153070.52 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 601.882624
+
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19267K messages. Throughput: 152553.26 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 601.882624
+
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19716K messages. Throughput: 152485.55 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 601.882624
+```
+
+We've managed to get similar results as in the performance test tool. Note that the measured latency is actually 
+the e2e latency from calling `send()` to executing provided callback. In the performance test tool, the latency was measured the 
+same way. This time however we got event better p99 results. 
+
+We will try to do another round of optimizations later when talking more about internals. Let's add some more features to
+our producer.
+
+### Adding serialization
+The first thing is that in the producer example we are generating payload bytes ready to sent without any serialization. 
+The `ByteArraySerializer` does nothing with the payload (it returns the same payload as given in argument . This is the 
+same what the kafka performance tool does. More realistic case would be to use some form of serialization like 
+[Avro](https://avro.apache.org/docs/), any other binary format or just JSON. We'll use serialization to JSON now.
+I've added serialization before sending the record. The same result could be achieved by implementing custom kafka 
+producer serializer. 
+
+```java
+public class AsyncAuditProducer implements ProgramLoop {
+    ...
+    private static Properties producerProperties() {
+        Properties props = new Properties();
+        ...
+        props.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        props.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        ...
+        
+        return props;
+    }
+
+    @Override
+    public void start() {
+        try {
+            long startMillis = System.currentTimeMillis();
+            while (running) {
+                try {
+                    AuditLog auditLog = generateExampleAuditLog();
+
+                    ProducerRecord<byte[], byte[]> record =
+                            new ProducerRecord<>(AUDIT_TOPIC, mapper.writeValueAsBytes(auditLog));
+
+                    long sendTime = System.currentTimeMillis();
+
+                    ...
+                } catch (Exception ex) {
+                    logger.error("Error while sending audit event", ex);
+                }
+            }
+        } finally {
+            producer.close();
+            logger.info("Closing producer...");
+        }
+    }
+    
+    // after JSON serialization it takes ~150 bytes
+    private static AuditLog generateExampleAuditLog() {
+        ActionType actionType = ActionType.values()[(int) (Math.random() * ActionType.values().length)];
+        String userId = "user-" + UUID.randomUUID();
+        long timestamp = Instant.now().toEpochMilli();
+        return new AuditLog(timestamp, userId, actionType, UUID.randomUUID().toString());
+    }
+}
+```
+
+Our serialized `AuditLog` object is around 150 bytes now. The time for generating example payload changed too so comparing 
+the results with previous ones is not fair. Let's just see what throughput/latency we can get with our current implementation. 
+
+```postgresql
+...
+.producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+.producer.AsyncAuditProducer - Send 19577K messages. Throughput: 191498.05 records/s
+.producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+
+.producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+.producer.AsyncAuditProducer - Send 20148K messages. Throughput: 191440.84 records/s
+.producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+```
+
+### Adding metadata in record headers
+
+
 
  # example with batching
  # example metrics
@@ -463,8 +671,6 @@ cluster, and connecting to each of them is not necessary until we have records t
 
 
 
-```postgresql
-./kafka-producer-perf-test.sh --record-size 200 --num-records 20000000 --throughput=-1 --topic userActivity --print-metrics --producer-props bootstrap.servers=localhost:9092 linger.ms=100 batch.size=1000000 acks=1 request.timeout.ms=1000 delivery.timeout.ms=3000
 ```
 zwiększyć maksymalny rozmiar requesta na brokerze i sprawdzić throughput
 
