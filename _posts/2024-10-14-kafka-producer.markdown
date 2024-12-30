@@ -126,7 +126,6 @@ Each of these fields you can provide while constructing the producer record, and
 This is how `send()` works:
 1. Based on the `topic`, the producer knows where (to which brokers) it has to send data.   
 2. **Serializing** `key` and `value`. Kafka doesn't care about the type of the key and value. All its wants is the array of bytes. 
-The key is used in partitioning (more about that in a moment), and the value is the actual message. Implementing a custom 
 serializer is easy - just implement the `org.apache.kafka.common.serialization.Serializer` interface. 
 3. **Partitioning**
    1. If the partition is specified upfront, the producer will send the message to the leader of that partition. Usage of this
@@ -258,8 +257,9 @@ toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kaf
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka4
 ```
 
-Now we can run the producer performance test. Let's say that we want to send as many messages as possible, but the maximum
-time from message being passed to the producer, to the delivery should not exceed 10s.
+Now we can run the producer performance test. Let's say that we have an application that is not so much sensitive to delays.
+We want to send as many messages as possible, but the maximum time from message being passed to the producer, to the delivery 
+should not exceed 10s.
 
 * `--record-size 200` - set the record size to 200 bytes
 * `--num-records 20000000` - send 20M records
@@ -276,7 +276,7 @@ It will just not wait any additional time for the batch to fill
 
 ```postgresql
 ./kafka-producer-perf-test.sh --record-size 200 --num-records 20000000 --throughput=-1 --topic userActivity \
-  --producer-props bootstrap.servers=localhost:9092 delivery.timeout.ms=10000 request.timeout.ms=5000 batch.size=16384 acks=1 \
+  --producer-props bootstrap.servers=localhost:9092 delivery.timeout.ms=10000 request.timeout.ms=3000 batch.size=16384 acks=1 \
   --print-metrics
 
 org.apache.kafka.common.errors.TimeoutException: Expiring 78 record(s) for userActivity-1:10001 ms has passed since batch creation
@@ -395,7 +395,7 @@ that message should be published up to 10s. I'll also send 20M messages as in th
 
 ```postgresql
 ./kafka-producer-perf-test.sh --record-size 200 --num-records 20000000 --throughput=-1 --topic userActivity \
-  --producer-props bootstrap.servers=localhost:9092 batch.size=262144 acks=1 delivery.timeout.ms=10000 request.timeout.ms=5000 \
+  --producer-props bootstrap.servers=localhost:9092 batch.size=262144 acks=1 delivery.timeout.ms=10000 request.timeout.ms=3000 \
   --print-metrics
 
 ...
@@ -476,7 +476,7 @@ public class AsyncAuditProducer implements ProgramLoop {
         // sending
         props.setProperty(ProducerConfig.ACKS_CONFIG, "1"); // only leader confirms
         props.setProperty(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "10000"); // 10s
-        props.setProperty(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "5000"); // 5s
+        props.setProperty(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "3000"); // 3s
         props.setProperty(ProducerConfig.MAX_BLOCK_MS_CONFIG, "1000"); // 1s
 
         return props;
@@ -630,23 +630,79 @@ public class AsyncAuditProducer implements ProgramLoop {
 }
 ```
 
-Our serialized `AuditLog` object is around 150 bytes now. The time for generating example payload changed too so comparing 
-the results with previous ones is not fair. Let's just see what throughput/latency we can get with our current implementation. 
+Our serialized `AuditLog` object is around 150 bytes now. The time for generating example payload changed too, so comparing 
+the results with previous ones is not fair. Let's just see what throughput/latency we can get with our current settings. 
 
 ```postgresql
 ...
-.producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
-.producer.AsyncAuditProducer - Send 19577K messages. Throughput: 191498.05 records/s
-.producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19577K messages. Throughput: 191498.05 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
 
-.producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
-.producer.AsyncAuditProducer - Send 20148K messages. Throughput: 191440.84 records/s
-.producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 20148K messages. Throughput: 191440.84 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
 ```
 
 ### Adding metadata in record headers
+The next common pattern in producer usage is to add metadata associated with the record. You can put here any information 
+which don't fit well into the payload, e.g. routing, tracing. The benefit is also that you don't have to deserialize the 
+payload on the consumer side to get this metadata. We'll add a simple tracing information to the record headers.
 
+```java
+public class AsyncAuditProducer implements ProgramLoop {
+    ...
+    private static Properties producerProperties() {
+        Properties props = new Properties();
+        ...
+        
+        return props;
+    }
 
+    @Override
+    public void start() {
+        try {
+            long startMillis = System.currentTimeMillis();
+            while (running) {
+                try {
+                    AuditLog auditLog = generateExampleAuditLog();
+
+                    ProducerRecord<byte[], byte[]> record =
+                            new ProducerRecord<>(AUDIT_TOPIC, mapper.writeValueAsBytes(auditLog));
+                    // Add tracing information
+                    byte [] traceId = "SomeTraceIdFromUpperLayers".getBytes();
+                    record.headers().add("trace-id", traceId);
+                    
+                    ...
+                } catch (Exception ex) {
+                    logger.error("Error while sending audit event", ex);
+                }
+            }
+        } finally {
+            producer.close();
+            logger.info("Closing producer...");
+        }
+    }
+    ...
+}
+```
+
+Performance results with settings untouched and added header:
+
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19341K messages. Throughput: 156832.18 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19828K messages. Throughput: 156960.12 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+```
+
+The throughput decreased. Obviously headers take some space so fewer data can be packed into a batch. Remember that 
+we didn't optimize the producer as best we could. We will do this later. I'm just showing you that headers don't come for free.
+
+### Partitioning
 
  # example with batching
  # example metrics
