@@ -670,7 +670,7 @@ public class AsyncAuditProducer implements ProgramLoop {
                     ProducerRecord<byte[], byte[]> record =
                             new ProducerRecord<>(AUDIT_TOPIC, mapper.writeValueAsBytes(auditLog));
                     // Add tracing information
-                    byte [] traceId = "SomeTraceIdFromUpperLayers".getBytes();
+                    byte [] traceId = "SomeTraceIdFromUpperLayers".getBytes(StandardCharsets.UTF_8);
                     record.headers().add("trace-id", traceId);
                     
                     ...
@@ -700,14 +700,84 @@ producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
 ```
 
 The throughput decreased. Obviously headers take some space so fewer data can be packed into a batch. Remember that 
-we didn't optimize the producer as best we could. We will do this later. I'm just showing you that headers don't come for free.
+we didn't optimize the producer as best we could. We will do this later. I'm just showing you that headers, as any added 
+data don't come for free.
 
-### Partitioning
+### Partitioning with key
+As mentioned at the beginning of the post, we can choose a partitioning for the record in a few ways. Out of the box solution 
+is that the producer picks a partition based on its internal load balancing algorithm (more about it later). This happened 
+so far in previous examples because we didn't configured anything for partitioning.  
 
- # example with batching
- # example metrics
- # exmaple of measuring e2e latency
+Given a record key, the producer calculates a hash of the key and uses that to pick a partition. Let's try to route all 
+records to the same partition. Our throughput should decrease ~3 times because we have 3 partitions, and now everything 
+goes to one of them. We are effectively decreasing a parallelism (more about it later). 
 
+```java
+public class AsyncAuditProducer implements ProgramLoop {
+    ...
+
+    private static Properties producerProperties() {
+        Properties props = new Properties();
+        ...
+
+        return props;
+    }
+
+    @Override
+    public void start() {
+        try {
+            long startMillis = System.currentTimeMillis();
+            while (running) {
+                try {
+                    AuditLog auditLog = generateExampleAuditLog();
+                    
+                    // all records will go to the same partition: hash(someKey) % numberOfPartitions
+                    byte[] someKey = "AuditLogGenericKey".getBytes(StandardCharsets.UTF_8);
+                    ProducerRecord<byte[], byte[]> record =
+                            // add key to the record
+                            new ProducerRecord<>(AUDIT_TOPIC, someKey, mapper.writeValueAsBytes(auditLog));
+
+                    byte [] traceId = "SomeTraceIdFromUpperLayers".getBytes(StandardCharsets.UTF_8);
+                    record.headers().add("trace-id", traceId);
+                    ...
+            }
+        } finally {
+            producer.close();
+            logger.info("Closing producer...");
+        }
+    }
+    ...
+}
+```
+
+The results in the previous benchmark with headers was ~150K records/sec. Now it is:
+
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19832K messages. Throughput: 47707.61 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 3355.4432
+
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19978K messages. Throughput: 47708.89 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 3355.4432
+```
+
+The throughput decreased as expected to ~50K. The latency increased probably because the queuing started to take effect. To be 
+sure I'd have to check producer metrics, but I'll describe it later. Alternatively we could use the kafka performance tool 
+with similar config and see metrics there. 
+
+So why one may even need that routing? One of the reasons is that you may want to preserve order of the produced records. 
+Once they go to the same partition, they will be processed in the order they were sent. For this to work we will need to 
+reassure that another few producer configs are set correctly (descried in dedicated section later). Consuming from multiple
+Kafka partitions can happen in parallel by independent processes. So once you sent specific records to the same partition, you're 
+forcing the consumer to process them in the order they were sent. By specifying the key, messages with the same key
+(thus with the same hash) will go to the same partition.  
+
+### Partitioning with custom partitioner
+
+
+
+# example metrics
 
 ### High level communication view
 
