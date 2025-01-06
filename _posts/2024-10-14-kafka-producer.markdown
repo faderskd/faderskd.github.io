@@ -706,7 +706,7 @@ data don't come for free.
 ### Partitioning with key
 As mentioned at the beginning of the post, we can choose a partitioning for the record in a few ways. Out of the box solution 
 is that the producer picks a partition based on its internal load balancing algorithm (more about it later). This happened 
-so far in previous examples because we didn't configured anything for partitioning.  
+so far in previous examples because we didn't configured anything for partitioning, and didn't use key.  
 
 Given a record key, the producer calculates a hash of the key and uses that to pick a partition. Let's try to route all 
 records to the same partition. Our throughput should decrease ~3 times because we have 3 partitions, and now everything 
@@ -775,6 +775,96 @@ forcing the consumer to process them in the order they were sent. By specifying 
 
 ### Partitioning with custom partitioner
 
+If you want to apply custom partitioning strategy you can implement your own partitioner. The very simple one would be 
+e.g. round-robin partitioner. Note that the partitioner should be thread-safe as it is called by 
+`send()` method which can be called by multiple threads. Our example is just using single calling thread. 
+
+```java
+// AsyncAuditProducer.java
+public class AsyncAuditProducer implements ProgramLoop {
+    ...
+    private static Properties producerProperties() {
+        Properties props = new Properties();
+        ...
+        // partitioning
+        props.setProperty(ProducerConfig.PARTITIONER_CLASS_CONFIG, RoundRobinPartitioner.class.getName());
+        // custom property used in our round robin partitioner
+        props.setProperty("monitoring.enabled", "true");
+        ...
+        return props;
+    }
+
+    @Override
+    public void start() {
+        try {
+            long startMillis = System.currentTimeMillis();
+            while (running) {
+                try {
+                    AuditLog auditLog = generateExampleAuditLog();
+
+                    ProducerRecord<byte[], byte[]> record =
+                            new ProducerRecord<>(AUDIT_TOPIC, mapper.writeValueAsBytes(auditLog));
+
+                    byte [] traceId = "SomeTraceIdFromUpperLayers".getBytes(StandardCharsets.UTF_8);
+                    record.headers().add("trace-id", traceId);
+                    ...
+                }
+            } finally {
+                producer.close();
+                logger.info("Closing producer...");
+            }
+        }
+    ...
+}
+
+// RoundRobinPartitioner.java
+public class RoundRobinPartitioner implements Partitioner {
+    private static final Logger logger = LoggerFactory.getLogger(RoundRobinPartitioner.class);
+    private ConcurrentHashMap<String, AtomicInteger> topicsCounters = new ConcurrentHashMap<>();
+    private boolean monitoringEnabled;
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
+        AtomicInteger topicCounter = topicsCounters.computeIfAbsent(topic, (t) -> new AtomicInteger());
+        if (monitoringEnabled) {
+            // measure something
+        }
+        return topicCounter.incrementAndGet() % cluster.partitionCountForTopic(topic);
+    }
+
+    @Override
+    public void close() {
+    }
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+        // getting custom properties
+        monitoringEnabled = Boolean.parseBoolean((String) configs.get("monitoring.enabled"));
+        logger.info("Staring custom round robin partitioner with monitoring enabled: {}", monitoringEnabled);
+    }
+}
+```
+
+The results are similar to the one with built-in partitioner from previous examples without a key.
+
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19325K messages. Throughput: 156768.86 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1539.309568
+
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19794K messages. Throughput: 156750.33 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1539.309568
+```
+
+The throughput is ~157K, p99 is ~1.5s. Note that there is already similar ready-to-use implementation in kafka clients 
+package: `org.apache.kafka.clients.producer.RoundRobinPartitioner`. Implementing a custom partitioner is rather less 
+common, and it is good to know what out of the box solutions are available. 
+
+### Built-in partitioner
+If we don't specify the partition in record used with `send(ProducerRecord)`, not use custom partitioner class, and don't
+provide a key, the producer will use its built-in partitioner. And this is fired [here](https://github.com/apache/kafka/blob/409a43eff77511e89bba2f95934cb1ebc417236d/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L310) 
+in the producer code. It is a sticky-partitioner which means that it will try to send records to the same partition 
 
 
 # example metrics
@@ -859,7 +949,7 @@ zwiększyć maksymalny rozmiar requesta na brokerze i sprawdzić throughput
    4. Once we have a partition, look for a queue of batches to that partition. Take the last batch, and
       if it's not full, append the record. Record the user provided callback and return a future. That callback will be then 
       called when the record is sent. We'll get to that. 
-   5. If the batch is full, we have to create a new one, but to that we need to allocate memory. `KafkaProducer` limits total 
+   5. If the batch is full (what does it mean to be full???), we have to create a new one, but to that we need to allocate memory. `KafkaProducer` limits total 
       memory usage to `buffer.memory` property. If we exceed that, we'll block until some memory is freed. Once we have memory,
       we create a new batch. 
    6. During the switch KafkaProducer informs the partitioner to pick the new partition. May exists edge cases when the 
