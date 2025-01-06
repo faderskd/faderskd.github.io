@@ -789,7 +789,7 @@ public class AsyncAuditProducer implements ProgramLoop {
         // partitioning
         props.setProperty(ProducerConfig.PARTITIONER_CLASS_CONFIG, RoundRobinPartitioner.class.getName());
         // custom property used in our round robin partitioner
-        props.setProperty("monitoring.enabled", "true");
+        props.setProperty("monitoring.enabled", "false");
         ...
         return props;
     }
@@ -864,10 +864,165 @@ common, and it is good to know what out of the box solutions are available.
 ### Built-in partitioner
 If we don't specify the partition in record used with `send(ProducerRecord)`, not use custom partitioner class, and don't
 provide a key, the producer will use its built-in partitioner. And this is fired [here](https://github.com/apache/kafka/blob/409a43eff77511e89bba2f95934cb1ebc417236d/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L310) 
-in the producer code. It is a sticky-partitioner which means that it will try to send records to the same partition 
+in the producer code. It is a so-called adaptive sticky partitioning, and it has the more sophisticated algorithm for 
+data distribution. But to understand its advantages, we'll compare it with our round-robin partitioner. The results for 
+tests run with built-in partitioner for example [while testing headers](#adding-metadata-in-record-headers) 
+and tests with [custom partitioner](#partitioning-with-custom-partitioner) didn't differ so much in terms of throughput and latency. 
+There is some variation, but I just run that tests once so it is nothing serious.
+
+Built-in partitioner:  
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19828K messages. Throughput: 156960.12 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
+```
+
+Round-robin partitioner:  
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 19794K messages. Throughput: 156750.33 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 1539.309568
+```
+
+But what happens when one of the broker is slow? To find out, I've added additional latency to one of the brokers. So now 
+broker `kafka1` has `300ms` of added latency while others have `100ms` as previously:
+```postgresql
+toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=300 -a jitter=50 kafka1
+toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka2
+toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka3
+toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka4
+```
+```postgresql
+~/D/k/bin ❯❯❯ ./kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic=userActivity
+
+Topic: userActivity     TopicId: 5Jy7kkJIRQ-4oJ--YgekVA PartitionCount: 3       ReplicationFactor: 3    Configs: segment.bytes=1073741824
+        Topic: userActivity     Partition: 0    Leader: 1       Replicas: 1,2,3 Isr: 1,2,3
+        Topic: userActivity     Partition: 1    Leader: 2       Replicas: 2,3,4 Isr: 2,3,4
+        Topic: userActivity     Partition: 2    Leader: 3       Replicas: 3,4,1 Isr: 3,4,1
+```
+
+`Kafka1` broker is seen as the node `1` in the output above so it is a leader for partition 1. 
 
 
-# example metrics
+Round-robin partitioner:  
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 10118K messages. Throughput: 44813.40 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 7782.531072
+producer.AsyncAuditProducer - Partition 0 : 4570645
+producer.AsyncAuditProducer - Partition 1 : 1376995
+producer.AsyncAuditProducer - Partition 2 : 4170777
+```
+
+Built-in, adaptive sticky partitioner:  
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 10880K messages. Throughput: 124688.25 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 3053.453312
+producer.AsyncAuditProducer - Partition 0 : 1754214
+producer.AsyncAuditProducer - Partition 1 : 4550191
+producer.AsyncAuditProducer - Partition 2 : 4575892
+```
+
+Built-in partitioner is much more resilient to slow brokers. The throughput is still high, the latency increased compared
+to tests with normal latency. It seems like the built-in partitioner is more aware of the broker's state and can adapt. 
+
+#### Built-in partitioner - more metrics
+
+Ok, what about measuring the number of records sent to each partition? We can do this by adding some monitoring to the code:
+```java
+public class AsyncAuditProducer implements ProgramLoop {
+    ...
+    private final AtomicInteger sentCounter = new AtomicInteger(0);
+    private final ConcurrentHashMap<Integer, AtomicInteger> partitionsSendCounters = new ConcurrentHashMap<>();
+
+    ...
+    public AsyncAuditProducer() {
+        this.producer = new KafkaProducer<>(producerProperties());
+        MeterRegistry meterRegistry = new SimpleMeterRegistry();
+        timer = Timer
+                .builder("send.latency")
+                .publishPercentiles(0.99)
+                .register(meterRegistry);
+    }
+
+    private static Properties producerProperties() {
+        ...
+        // partitioning - remove this line to use built-in partitioner
+        props.setProperty(ProducerConfig.PARTITIONER_CLASS_CONFIG, RoundRobinPartitioner.class.getName());
+        ...
+
+        return props;
+    }
+
+    @Override
+    public void start() {
+        try {
+            long startMillis = System.currentTimeMillis();
+            while (running) {
+                try {
+                    AuditLog auditLog = generateExampleAuditLog();
+
+                    ProducerRecord<byte[], byte[]> record =
+                            new ProducerRecord<>(AUDIT_TOPIC, mapper.writeValueAsBytes(auditLog));
+
+                    ...
+                    long sendTime = System.currentTimeMillis();
+
+                    producer.send(record, (metadata, exception) -> {
+                        if (exception != null) {
+                            logger.error("Error while sending audit event", exception);
+                        } else {
+                            timer.record(System.currentTimeMillis() - sendTime, TimeUnit.MILLISECONDS);
+                            sentCounter.incrementAndGet();
+                            // add metrics per partition
+                            partitionsSendCounters.
+                                    computeIfAbsent(metadata.partition(), (p) -> new AtomicInteger())
+                                    .incrementAndGet();
+                            reportMetrics(startMillis);
+                        }
+                    });
+                    if (sentCounter.get() >= 20000000) {
+                        break;
+                    }
+                } catch (Exception ex) {
+                    logger.error("Error while sending audit event", ex);
+                }
+            }
+        } finally {
+            producer.close();
+            logger.info("Closing producer...");
+        }
+    }
+
+    private void reportMetrics(long startMillis) {
+        if (System.currentTimeMillis() - lastReportMillis > 3000) {
+            ...
+            partitionsSendCounters.forEach((partition, counter) ->
+                    logger.info("Partition {} : {}", partition, counter.get()));
+        }
+    }
+}
+```
+
+The results for round-robin partitioner:  
+```postgresql
+producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
+producer.AsyncAuditProducer - Send 20105K messages. Throughput: 43870.86 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 8050.966528
+producer.AsyncAuditProducer - Partition 0 : 8059532
+producer.AsyncAuditProducer - Partition 1 : 9249785
+producer.AsyncAuditProducer - Partition 2 : 2796126
+```
+
+Built-in partitioner:  
+```postgresql
+producer.AsyncAuditProducer - Send 19976K messages. Throughput: 125086.07 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 2919.235584
+producer.AsyncAuditProducer - Partition 0 : 8387826
+producer.AsyncAuditProducer - Partition 1 : 3228094
+producer.AsyncAuditProducer - Partition 2 : 8360825
+```
 
 ### High level communication view
 
