@@ -878,6 +878,7 @@ producer.AsyncAuditProducer - Percentile 0.99 : 1174.40512
 ```
 
 Round-robin partitioner:  
+
 ```postgresql
 producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
 producer.AsyncAuditProducer - Send 19794K messages. Throughput: 156750.33 records/s
@@ -886,12 +887,14 @@ producer.AsyncAuditProducer - Percentile 0.99 : 1539.309568
 
 But what happens when one of the broker is slow? To find out, I've added additional latency to one of the brokers. So now 
 broker `kafka1` has `300ms` of added latency while others have `100ms` as previously:
+
 ```postgresql
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=300 -a jitter=50 kafka1
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka2
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka3
 toxiproxy-cli toxic add -t latency -n kafkaToxic -a latency=100 -a jitter=50 kafka4
 ```
+
 ```postgresql
 ~/D/k/bin ❯❯❯ ./kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic=userActivity
 
@@ -901,27 +904,22 @@ Topic: userActivity     TopicId: 5Jy7kkJIRQ-4oJ--YgekVA PartitionCount: 3       
         Topic: userActivity     Partition: 2    Leader: 3       Replicas: 3,4,1 Isr: 3,4,1
 ```
 
-`Kafka1` broker is seen as the node `1` in the output above so it is a leader for partition 1. 
+`Kafka1` broker is seen as the node `1` in the output above so it is a leader for partition `0`. 
 
+Round-robin partitioner (I sent only 10M messages because of impatience):
 
-Round-robin partitioner:  
 ```postgresql
 producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
 producer.AsyncAuditProducer - Send 10118K messages. Throughput: 44813.40 records/s
 producer.AsyncAuditProducer - Percentile 0.99 : 7782.531072
-producer.AsyncAuditProducer - Partition 0 : 4570645
-producer.AsyncAuditProducer - Partition 1 : 1376995
-producer.AsyncAuditProducer - Partition 2 : 4170777
 ```
 
 Built-in, adaptive sticky partitioner:  
+
 ```postgresql
 producer.AsyncAuditProducer - ------------------------- Reporting metrics --------------------------------------
 producer.AsyncAuditProducer - Send 10880K messages. Throughput: 124688.25 records/s
 producer.AsyncAuditProducer - Percentile 0.99 : 3053.453312
-producer.AsyncAuditProducer - Partition 0 : 1754214
-producer.AsyncAuditProducer - Partition 1 : 4550191
-producer.AsyncAuditProducer - Partition 2 : 4575892
 ```
 
 Built-in partitioner is much more resilient to slow brokers. The throughput is still high, the latency increased compared
@@ -929,22 +927,14 @@ to tests with normal latency. It seems like the built-in partitioner is more awa
 
 #### Built-in partitioner - more metrics
 
-Ok, what about measuring the number of records sent to each partition? We can do this by adding some monitoring to the code:
+Ok, what about measuring the number of records sent to each partition? We can do this by adding some monitoring to the code. 
+We'll use `partitionsSendCounters` map with atomic counter for each partition. 
+
 ```java
 public class AsyncAuditProducer implements ProgramLoop {
     ...
     private final AtomicInteger sentCounter = new AtomicInteger(0);
     private final ConcurrentHashMap<Integer, AtomicInteger> partitionsSendCounters = new ConcurrentHashMap<>();
-
-    ...
-    public AsyncAuditProducer() {
-        this.producer = new KafkaProducer<>(producerProperties());
-        MeterRegistry meterRegistry = new SimpleMeterRegistry();
-        timer = Timer
-                .builder("send.latency")
-                .publishPercentiles(0.99)
-                .register(meterRegistry);
-    }
 
     private static Properties producerProperties() {
         ...
@@ -961,14 +951,7 @@ public class AsyncAuditProducer implements ProgramLoop {
             long startMillis = System.currentTimeMillis();
             while (running) {
                 try {
-                    AuditLog auditLog = generateExampleAuditLog();
-
-                    ProducerRecord<byte[], byte[]> record =
-                            new ProducerRecord<>(AUDIT_TOPIC, mapper.writeValueAsBytes(auditLog));
-
                     ...
-                    long sendTime = System.currentTimeMillis();
-
                     producer.send(record, (metadata, exception) -> {
                         if (exception != null) {
                             logger.error("Error while sending audit event", exception);
@@ -982,13 +965,7 @@ public class AsyncAuditProducer implements ProgramLoop {
                             reportMetrics(startMillis);
                         }
                     });
-                    if (sentCounter.get() >= 20000000) {
-                        break;
-                    }
-                } catch (Exception ex) {
-                    logger.error("Error while sending audit event", ex);
-                }
-            }
+                    ...
         } finally {
             producer.close();
             logger.info("Closing producer...");
@@ -1024,6 +1001,52 @@ producer.AsyncAuditProducer - Partition 1 : 3228094
 producer.AsyncAuditProducer - Partition 2 : 8360825
 ```
 
+The round-robin partitioner sent less record to a healthy partition `2` while almost equally to partitions `0` (unhealthy) and `1`.
+The built-in partitioner on the other hand, made a good job by giving a slow broker chance to catch his breath. But how it is 
+possible that we call `topicCounter.incrementAndGet() % cluster.partitionCountForTopic(topic)` once for each message 
+in our partitioner and the records are not evenly distributed? The answer is hidden in the implementation details but covering 
+it would be too much for an already very long post. Spoiler: `partition(...)` of the partitioner is not necessarily called
+once for each message, thus can produce skewed distribution when unequal latency happens. 
+
+#### Built-in partitioner - more configuration
+
+As you see the [built-in](https://cwiki.apache.org/confluence/display/KAFKA/KIP-794%3A+Strictly+Uniform+Sticky+Partitioner) partitioner is quite smart. 
+What's interesting, previously in Kafka there was a [StickyPartitioner](https://cwiki.apache.org/confluence/display/KAFKA/KIP-480%3A+Sticky+Partitioner) which had a problem 
+with skewed distribution too: slower partitions got more records. The [built-in adaptive partitioner](https://cwiki.apache.org/confluence/display/KAFKA/KIP-794%3A+Strictly+Uniform+Sticky+Partitioner)
+fixes that problem. As stated before, if you don't specify the partitioner class, the built-in adaptive one is used. And we have a 
+few configuration options to adjust its behavior when bad things happen.
+
+[partitioner.adaptive.partitioning.enable](https://kafka.apache.org/documentation/#producerconfigs_partitioner.adaptive.partitioning.enable) - 
+whether to adapt to broker performance. It is enabled by default, and we used in tests for built-in partitioner. If we disable it 
+the partitioner will:
+1. pick a random partition
+2. produce `batch.size` bytes of records
+3. switch to the next partition
+
+```java
+    private static Properties producerProperties() {
+    Properties props = new Properties();
+    ...
+    // partitioning
+//        props.setProperty(ProducerConfig.PARTITIONER_CLASS_CONFIG, RoundRobinPartitioner.class.getName());
+    props.setProperty(ProducerConfig.PARTITIONER_ADPATIVE_PARTITIONING_ENABLE_CONFIG, "false");
+
+    ...
+    return props;
+}
+```
+
+```postgresql
+producer.AsyncAuditProducer - Send 20121K messages. Throughput: 52097.48 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 8050.966528
+producer.AsyncAuditProducer - Partition 0 : 7746897
+producer.AsyncAuditProducer - Partition 1 : 6079592
+producer.AsyncAuditProducer - Partition 2 : 6295381
+```
+
+The latency came back to round-robin partitioner level. The throughput is also similar. While the distribution is not perfect 
+and the slow partitions got more messages it is much better than in round-robin partitioner. 
+
 ### High level communication view
 
 
@@ -1036,11 +1059,6 @@ cluster, and connecting to each of them is not necessary until we have records t
 
 ### KafkaProducer components
 // TODO - explain role of each component + diagram
-
-
-
-
-
 
 ```
 zwiększyć maksymalny rozmiar requesta na brokerze i sprawdzić throughput
