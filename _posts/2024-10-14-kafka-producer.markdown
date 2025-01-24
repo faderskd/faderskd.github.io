@@ -210,7 +210,8 @@ serializer is easy - just implement the `org.apache.kafka.common.serialization.S
    example if you configure `acks=1` the producer will disable idempotence. 
    For explanation how it internally works see **Idempotent Producer** chapter in [Kafka transactions post]({% post_url 2024-02-21-kafka-transactions %}).
    11. [max.in.flight.requests.per.connection](https://kafka.apache.org/documentation/#producerconfigs_max.in.flight.requests.per.connection) -
-       ...
+   how many requests can be sent to a broker without waiting for a response. The default value is 5. We'll see the effects 
+   of this configuration later.     
 
 And these are the most important configurations for the producer. Obviously there are many more, but they are more advanced 
 and configured much less frequently. We will cover few of them when touching internals of the producer later.  
@@ -861,6 +862,114 @@ The throughput is ~157K, p99 is ~1.5s. Note that there is already similar ready-
 package: `org.apache.kafka.clients.producer.RoundRobinPartitioner`. Implementing a custom partitioner is rather less 
 common, and it is good to know what out of the box solutions are available. 
 
+### Kafka producer sending internals
+
+Before describing the default partitioner strategy, I have to cover a little more about the producer internals. Kafka producer
+sending process involves few components. The diagram below shows how each component is used by the other.
+
+// P3 excalidraw
+
+1. [`KafkaProducer`] is a main entry point for sending records with a `send(ProducerRecord)` method. 
+2. [`ProducerMetadata`] The first thing the producer is doing is searching for metadata of the record's topic in metadata cache. If it is not 
+available, the producer will schedule an update and [wait](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1027).
+Metadata is information about the topic like partitions, replicas, leaders, etc. 
+3. Once it has metadata, the serialization [happens](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1046) as mentioned before.
+4. [`Partitioner (custom)`] - if the partition was not given in the record, [use custom](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1463)) partitioner if present. This is 
+the interface we've implemented with `RoundRobinPartitioner`.
+5. [`Partitioner (built-in)`] - if partition is not resolved **and record has key**, [use murmur2 hash](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1475) 
+from Kafka built-in partitioner to calculate partition.
+6. [`RecordAccumulator`] - finally, [append the record](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1071) to the accumulator. 
+If partition was still not resolved, it will [happen](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L310) 
+in the accumulator by using built-in partitioner. The built-in partitioner makes choice based on performance metrics of each partition (more in a moment).
+
+
+```
+4. Calculate the partition for the record: 
+   a) If partition is specified in the record, use it.
+   b) If custom partitioner is specified, use it.
+   c) If key is present, use the hash of the key.
+   d) If key is not present, use return UNKNOWN_PARTITION and delay partition choice.
+5. Append record to accumulator:
+   1. Get current sticky partition. 
+   2. If we don't have load stats
+      1. get random available partitions from the metadata (point 2). Available partition is 
+      a one that has a leader. 
+      2. If we don't have available partitions just get random partition.
+   3. If we have load stats, get random partition using probability proportional to the lowest load: the lower the load
+      the higher the probability of choosing the partition. The load stats are calculated using cumulative frequency table. 
+      It works as follows: (#TODO: How adaptive partitioning fits into this?)  
+      a) We have a list of partitions with their loads expressed as diff between max allowed queue (what is queue?) of the partition 
+         and current queue size + 1. 
+      b) We calculate cumulative frequency table for the partitions.
+      c) We choose a random number between 0 and sum of all loads.
+      d) We find the partition for which the random number is strictly greater than cumulative frequency.
+      e) Example: 
+         - We have 3 partitions (0,1,2) with loads: 5, 1, 3. Max queue size is: 7. Random number is 4. 
+         - Diffs: [7 - 5 + 1, 7 - 1 + 1, 7 - 3 + 1] = [3, 7, 5]
+         - Cumulative frequency: [3, 10, 15]
+         - Random number is 4, so strictly greater cumulative frequency is 10 - thus it is partition 1.
+   4. Once we have a partition, look for a queue of batches to that partition. Take the last batch, and
+      if it's not full, append the record. Record the user provided callback and return a future. That callback will be then 
+      called when the record is sent. We'll get to that. 
+   5. If the batch is full (what does it mean to be full???), we have to create a new one, but to that we need to allocate memory. `KafkaProducer` limits total 
+      memory usage to `buffer.memory` property. If we exceed that, we'll block until some memory is freed. Once we have memory,
+      we create a new batch. 
+   6. During the switch KafkaProducer informs the partitioner to pick the new partition. May exists edge cases when the 
+      `linger.ms` passed, but the bytes sent < `batch.size`. In that case, we'll send the batch anyway, but don't immediately change 
+      partition. Max 2x `batch.size` can be sent in that case.
+6. Sending messages
+   1. Once message is appended to the batch, we return a future to the client. The future is completed when the record is sent. 
+      If the batch is full we notify the sender so it can start sending the batch to the broker.
+   2. The KafkaProducer uses a single io thread to run sender in a loop.  
+   3. Each iteration of the loop will try to find and send ready broker nodes -> with partitions -> with batches ready to be sent. 
+      The broker is ready if there is at least one partition that is not backing off its send (#TODO when can backoff) 
+      and those partitions are not excluded from new messages sending, which is the case when 
+      ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION == 1). 
+   4. Once we have candidate partition for sending we, one of the following must be true:
+      1. The partition has full batch to be sent.
+      2. The partition batch's linger time passed.
+      3. KafkaProducer is out of memory so it tries to immediately send the batches (even uncompleted) to their partitions 
+      and free some memory. 
+   5. By the way of calculating ready nodes to send data the KafkaProducer calculates here statistics for adaptive partitioning 
+      used in point 5.3.
+      - checking if partitions have leaders
+      - getting partitions queue size
+      - if enabled adaptive partitioning with incorporating broker's latency, excluding slower brokers from sending data
+   6. Once we have a nodes, their respective partitions and batches for each partition to send, we have to transform that data 
+      into a format that can be sent to the broker - to the `ProduceRequest`. Kafka has its own binary [protocol](https://kafka.apache.org/protocol) 
+      for that. The request to a single node looks more/less like this:
+      ```
+      ProduceRequest(
+        transactionalId = 1, // for more details see my previous post about transactions 
+        acks = 1, // see my post about replication and acks
+        timeoutMs = 1000,
+        topicData = [
+          TopicData(
+            name = "topic",
+            partitionData = [
+              PartitionData(
+                index = 0,
+                records = [
+                  Record(
+                    key = "key",
+                    value = "value"
+                    headers = [...]
+                    ...
+                  )
+                ]
+              )
+            ]
+          )
+        ]
+      )
+      ```
+      Obviously the real request is more complex, but this is the gist of it. Single producer instance can send multiple 
+      requests like that to multiple brokers at the same time. 
+   7. The response contains metadata about each batch for each topic partition. For each record in each batch KafkaProducer 
+      then call user provided callback with that metadata as an argument. Note that the callback is called in the same thread 
+      as the rest of producer's stuff, so don't use the blocking or long-running operations there. 
+```
+
 ### Built-in partitioner
 If we don't specify the partition in record used with `send(ProducerRecord)`, not use custom partitioner class, and don't
 provide a key, the producer will use its built-in partitioner. And this is fired [here](https://github.com/apache/kafka/blob/409a43eff77511e89bba2f95934cb1ebc417236d/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L310) 
@@ -994,17 +1103,17 @@ producer.AsyncAuditProducer - Partition 2 : 2796126
 
 Built-in partitioner:  
 ```postgresql
-producer.AsyncAuditProducer - Send 19976K messages. Throughput: 125086.07 records/s
+producer.AsyncAuditProducer - Send 20017K messages. Throughput: 123201.39 records/s
 producer.AsyncAuditProducer - Percentile 0.99 : 2919.235584
-producer.AsyncAuditProducer - Partition 0 : 8387826
-producer.AsyncAuditProducer - Partition 1 : 3228094
-producer.AsyncAuditProducer - Partition 2 : 8360825
+producer.AsyncAuditProducer - Partition 0 : 3280836
+producer.AsyncAuditProducer - Partition 1 : 8344435
+producer.AsyncAuditProducer - Partition 2 : 8391752
 ```
 
 The round-robin partitioner sent less record to a healthy partition `2` while almost equally to partitions `0` (unhealthy) and `1`.
 The built-in partitioner on the other hand, made a good job by giving a slow broker chance to catch his breath. But how it is 
 possible that we call `topicCounter.incrementAndGet() % cluster.partitionCountForTopic(topic)` once for each message 
-in our partitioner and the records are not evenly distributed? The answer is hidden in the implementation details but covering 
+in our round-robin partitioner and the records are not evenly distributed? The answer is hidden in the implementation details but covering 
 it would be too much for an already very long post. Spoiler: `partition(...)` of the partitioner is not necessarily called
 once for each message, thus can produce skewed distribution when unequal latency happens. 
 
@@ -1016,21 +1125,25 @@ with skewed distribution too: slower partitions got more records. The [built-in 
 fixes that problem. As stated before, if you don't specify the partitioner class, the built-in adaptive one is used. And we have a 
 few configuration options to adjust its behavior when bad things happen.
 
-[partitioner.adaptive.partitioning.enable](https://kafka.apache.org/documentation/#producerconfigs_partitioner.adaptive.partitioning.enable) - 
-whether to adapt to broker performance. It is enabled by default, and we used in tests for built-in partitioner. If we disable it 
+**[partitioner.adaptive.partitioning.enable](https://kafka.apache.org/documentation/#producerconfigs_partitioner.adaptive.partitioning.enable)** - 
+whether to adapt to broker performance. It is enabled by default, and we used in tests for built-in partitioner. When enabled 
 the partitioner will:
+1. check the queue sizes of the partitions
+
+
+If we disable it the partitioner will:
 1. pick a random partition
 2. produce `batch.size` bytes of records
-3. switch to the next partition
+3. then switch to the next partition
 
 ```java
     private static Properties producerProperties() {
     Properties props = new Properties();
     ...
     // partitioning
-//        props.setProperty(ProducerConfig.PARTITIONER_CLASS_CONFIG, RoundRobinPartitioner.class.getName());
+    // disable our custom partitioner so the built-in will be used
+    // props.setProperty(ProducerConfig.PARTITIONER_CLASS_CONFIG, RoundRobinPartitioner.class.getName());
     props.setProperty(ProducerConfig.PARTITIONER_ADPATIVE_PARTITIONING_ENABLE_CONFIG, "false");
-
     ...
     return props;
 }
@@ -1044,8 +1157,86 @@ producer.AsyncAuditProducer - Partition 1 : 6079592
 producer.AsyncAuditProducer - Partition 2 : 6295381
 ```
 
-The latency came back to round-robin partitioner level. The throughput is also similar. While the distribution is not perfect 
-and the slow partitions got more messages it is much better than in round-robin partitioner. 
+The latency came back to the round-robin partitioner level. The throughput is also similar. While the distribution is not perfect 
+and the slow partitions got more messages it is much better than in round-robin partitioner. Messages generated by my `AsyncAuditProducer`
+producer are roughly the same size, so the results indicate that the slowest broker indeed got more data even in case of built-in implementation.  
+The diff between the slowest partition `0` and the partition `1` with the lowest number of messages is `7746897 - 6295381 =~ 1.4M`.
+The throughput is `~52K` records/sec so the diff had to accrue over the longer period. In case of the round-robin partitioner 
+the diff was `8059532 - 2796126 =~ 5.3M`.
+
+I had to double-check and compare it with kafka-performance tool. Maybe I missed something in the producer code.  
+The config and message size are the same as for our own producer benchmark above. The throughput may differ a little bit because 
+we have added serialization, headers, etc. I just wanted to see if partitions will be equally loaded: 
+
+```postgresql
+./kafka-producer-perf-test.sh --record-size 150 --num-records 20000000 --throughput=-1 --topic userActivity \
+  --producer-props bootstrap.servers=localhost:9092 delivery.timeout.ms=10000 request.timeout.ms=5000 batch.size=262144 acks=1 max.block.ms=1000 \
+  --print-metrics
+
+20000000 records sent, 69960.402412 records/sec (10.01 MB/sec), 2853.64 ms avg latency, 8330.00 ms max latency, 210 ms 50th, 7759 ms 95th, 7946 ms 99th, 8132 ms 99.9th.
+...
+producer-node-metrics:outgoing-byte-total:{client-id=perf-producer-client, node-id=node-1}     : 1182270704.000
+producer-node-metrics:outgoing-byte-total:{client-id=perf-producer-client, node-id=node-2}     : 974298329.000
+producer-node-metrics:outgoing-byte-total:{client-id=perf-producer-client, node-id=node-3}     : 1045194709.000
+...
+```
+
+The diff between the slowest node (partition `0`) and node with the lowest number of bytes sent (partition `2`) is 
+`1182270704 - 974298329 =~ 208MB`. The throughput is `~10MB/sec` so the diff had to accumulate over `~20s` and is 
+probably not just the effect of unfortunate timing. So now we know that the adaptive partitioning is something we really need.
+The `props.setProperty(ProducerConfig.PARTITIONER_ADPATIVE_PARTITIONING_ENABLE_CONFIG` should be left as `true`. 
+
+**[partitioner.availability.timeout.ms](https://kafka.apache.org/documentation/#producerconfigs_partitioner.availability.timeout.ms)** - 
+it is a time threshold the built-in partitioner waits for the ready batches to be started sending. Technically it means that:
+1. if we define `readyTimestamp` as time when partition has ready to sent batches (`linger.ms` passed or batch is full)
+2. and `drainTimestamp` as time when ready batches (waiting in a queue to be sent) are actually got from that queue, put into
+produce request and sent to the broker. This happens if the producer has active connection with the broker, the max in-flight
+messages were not reached, etc.
+3. then if `readyTimestamp` - `drainTimestamp` > `partitioner.availability.timeout.ms` the partitioner will temporarily stop sending 
+data to that partition because it is considered as too slow and causes higher latencies, queuing, etc.  
+
+Let's try setting `partitioner.availability.timeout.ms` to `50ms`: 
+
+```java
+    private static Properties producerProperties() {
+    Properties props = new Properties();
+    ...
+    // partitioning
+    props.setProperty(ProducerConfig.PARTITIONER_ADPATIVE_PARTITIONING_ENABLE_CONFIG, "true");
+    props.setProperty(ProducerConfig.PARTITIONER_AVAILABILITY_TIMEOUT_MS_CONFIG, "50");
+    ...
+    return props;
+}
+```
+
+The results:
+```postgresql
+producer.AsyncAuditProducer - Send 19811K messages. Throughput: 120023.17 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 2682.257408
+producer.AsyncAuditProducer - Partition 0 : 3328407
+producer.AsyncAuditProducer - Partition 1 : 8178502
+producer.AsyncAuditProducer - Partition 2 : 8304836
+```
+
+The results for adaptive partitioning without availability timeout were:
+
+```postgresql
+producer.AsyncAuditProducer - Send 20017K messages. Throughput: 123201.39 records/s
+producer.AsyncAuditProducer - Percentile 0.99 : 2919.235584
+producer.AsyncAuditProducer - Partition 0 : 3280836
+producer.AsyncAuditProducer - Partition 1 : 8344435
+producer.AsyncAuditProducer - Partition 2 : 8391752
+```
+
+I've tried with many different configurations, but it didn't help. The throughput/latency were on the same level as without 
+availability timeout set. Decreasing it to below `40ms` started to negatively affect both latency and throughput. 
+I've thought that maybe the higher percentiles will be better, but they were not. Here is the chart for 
+p999 latency for 8 runs with adaptive availability timeout set to `50ms` vs without it.  
+
+![adaptive-timeout-bench]({{site.baseurl}}/img/producer/adaptive-timeout-bench.png)
+
+The throughput was always ~120K records/sec. The difference in messages sent to fast partitions vs the slowest was also 
+always very similar to the one without `partitioner.availability.timeout.ms` set. Before 
 
 ### High level communication view
 
@@ -1086,96 +1277,3 @@ zwiększyć maksymalny rozmiar requesta na brokerze i sprawdzić throughput
     15. if it is in sender thread and throughput is much lower than network bandwidth or record queue time is large or 
     the batch_size_avg is almost as batch.size
     16. if it is in broker that latency will be high
-
-### KafkaProducer send
-
-1. Call interceptors on a record - this can change the record before it will be serialized.
-2. Fetch metadata for the topic of the record. If no metadata is available for topic, the producer will add
-   the topic to the metadata list and schedule metadata update. The call is blocked until metadata is available. 
-   Note that matatada is updated only for interested topics - the ones for which the producer has records to send.
-   #TODO - how metadata updating works
-3. Serialize the record key and value.
-4. Calculate the partition for the record: 
-   a) If partition is specified in the record, use it.
-   b) If custom partitioner is specified, use it.
-   c) If key is present, use the hash of the key.
-   d) If key is not present, use return UNKNOWN_PARTITION and delay partition choice.
-5. Append record to accumulator:
-   1. Get current sticky partition. 
-   2. If we don't have load stats
-      1. get random available partitions from the metadata (point 2). Available partition is 
-      a one that has a leader. 
-      2. If we don't have available partitions just get random partition.
-   3. If we have load stats, get random partition using probability proportional to the lowest load: the lower the load
-      the higher the probability of choosing the partition. The load stats are calculated using cumulative frequency table. 
-      It works as follows: (#TODO: How adaptive partitioning fits into this?)  
-      a) We have a list of partitions with their loads expressed as diff between max allowed queue (what is queue?) of the partition 
-         and current queue size + 1. 
-      b) We calculate cumulative frequency table for the partitions.
-      c) We choose a random number between 0 and sum of all loads.
-      d) We find the partition for which the random number is strictly greater than cumulative frequency.
-      e) Example: 
-         - We have 3 partitions (0,1,2) with loads: 5, 1, 3. Max queue size is: 7. Random number is 4. 
-         - Diffs: [7 - 5 + 1, 7 - 1 + 1, 7 - 3 + 1] = [3, 7, 5]
-         - Cumulative frequency: [3, 10, 15]
-         - Random number is 4, so strictly greater cumulative frequency is 10 - thus it is partition 1.
-   4. Once we have a partition, look for a queue of batches to that partition. Take the last batch, and
-      if it's not full, append the record. Record the user provided callback and return a future. That callback will be then 
-      called when the record is sent. We'll get to that. 
-   5. If the batch is full (what does it mean to be full???), we have to create a new one, but to that we need to allocate memory. `KafkaProducer` limits total 
-      memory usage to `buffer.memory` property. If we exceed that, we'll block until some memory is freed. Once we have memory,
-      we create a new batch. 
-   6. During the switch KafkaProducer informs the partitioner to pick the new partition. May exists edge cases when the 
-      `linger.ms` passed, but the bytes sent < `batch.size`. In that case, we'll send the batch anyway, but don't immediately change 
-      partition. Max 2x `batch.size` can be sent in that case.
-6. Sending messages
-   1. Once message is appended to the batch, we return a future to the client. The future is completed when the record is sent. 
-      If the batch is full we notify the sender so it can start sending the batch to the broker.
-   2. The KafkaProducer uses a single io thread to run sender in a loop.  
-   3. Each iteration of the loop will try to find and send ready broker nodes -> with partitions -> with batches ready to be sent. 
-      The broker is ready if there is at least one partition that is not backing off its send (#TODO when can backoff) 
-      and those partitions are not excluded from new messages sending, which is the case when 
-      ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION == 1). 
-   4. Once we have candidate partition for sending we, one of the following must be true:
-      1. The partition has full batch to be sent.
-      2. The partition batch's linger time passed.
-      3. KafkaProducer is out of memory so it tries to immediately send the batches (even uncompleted) to their partitions 
-      and free some memory. 
-   5. By the way of calculating ready nodes to send data the KafkaProducer calculates here statistics for adaptive partitioning 
-      used in point 5.3.
-      - checking if partitions have leaders
-      - getting partitions queue size
-      - if enabled adaptive partitioning with incorporating broker's latency, excluding slower brokers from sending data
-   6. Once we have a nodes, their respective partitions and batches for each partition to send, we have to transform that data 
-      into a format that can be sent to the broker - to the `ProduceRequest`. Kafka has its own binary [protocol](https://kafka.apache.org/protocol) 
-      for that. The request to a single node looks more/less like this:
-      ```
-      ProduceRequest(
-        transactionalId = 1, // for more details see my previous post about transactions 
-        acks = 1, // see my post about replication and acks
-        timeoutMs = 1000,
-        topicData = [
-          TopicData(
-            name = "topic",
-            partitionData = [
-              PartitionData(
-                index = 0,
-                records = [
-                  Record(
-                    key = "key",
-                    value = "value"
-                    headers = [...]
-                    ...
-                  )
-                ]
-              )
-            ]
-          )
-        ]
-      )
-      ```
-      Obviously the real request is more complex, but this is the gist of it. Single producer instance can send multiple 
-      requests like that to multiple brokers at the same time. 
-   7. The response contains metadata about each batch for each topic partition. For each record in each batch KafkaProducer 
-      then call user provided callback with that metadata as an argument. Note that the callback is called in the same thread 
-      as the rest of producer's stuff, so don't use the blocking or long-running operations there. 
