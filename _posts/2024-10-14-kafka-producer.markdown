@@ -30,7 +30,7 @@ but also some interesting internals.
 ### KafkaProducer basic config and usage
 
 We'll start with something really simple. This is the bare minimum configuration and the simplest usage. 
-Don't get this tiny example seriously - this code sucks, but we'll improve it later. 
+Don't get this tiny example seriously - this code sucks, but we'll improve it. 
 
 ```java
 public class SynchronousAuditProducer implements ProgramLoop {
@@ -869,6 +869,8 @@ sending process involves few components. The diagram below shows how each compon
 
 // P3 excalidraw
 
+The process of sending a message comes down to (with components in square brackets where the things happen):  
+
 1. [`KafkaProducer`] is a main entry point for sending records with a `send(ProducerRecord)` method. 
 2. [`ProducerMetadata`] The first thing the producer is doing is searching for metadata of the record's topic in metadata cache. If it is not 
 available, the producer will schedule an update and [wait](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1027).
@@ -880,15 +882,25 @@ the interface we've implemented with `RoundRobinPartitioner`.
 from Kafka built-in partitioner to calculate partition.
 6. [`RecordAccumulator`] - finally, [append the record](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1071) to the accumulator. 
 If partition was still not resolved, it will [happen](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L310) 
-in the accumulator by using built-in partitioner. The built-in partitioner makes choice based on performance metrics of each partition (more in a moment).
+in the accumulator using built-in partitioner. The selection process depends on different partitioner configurations, but we have 
+few choices here:
+    - based on the performance metrics (adaptive partitioning)
+    - uniform distribution - each partition gets equal number of bytes (adaptive partitioning disabled)
+7. [`RecordAccumulator`] - append the record to the existing batch or create a new one if the current batch is closed - 
+because of the size or linger time. For each of the topic partition the accumulator maintains a [queue](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L325) 
+of batches. Some of them are ready to sent, because they are full or linger time passed. 
+// P4 image with queues in accumulator
+8. [`RecordAccumulator`] - if the latest batch for a partition was closed because it is full or linger time passed and 
+the sending started, the accumulator will try to allocate a new one. 
+9. [`BufferPool`] - the responsibility of keeping the memory for the batches is on the buffer pool. If the record accumulator 
+tries to allocate a batch without sufficient memory we will have to [wait](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/internals/BufferPool.java#L153).
+10. When all of the above succeeded, the producer returns a [future](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L1099) 
+to the `send()` method caller, which completes when the record is sent.
+11. [`Sender`] - in the background, the producer has a single [IO thread](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java#L467) 
+running the sender [loop](https://github.com/apache/kafka/blob/3.9/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L249). 
 
 
 ```
-4. Calculate the partition for the record: 
-   a) If partition is specified in the record, use it.
-   b) If custom partitioner is specified, use it.
-   c) If key is present, use the hash of the key.
-   d) If key is not present, use return UNKNOWN_PARTITION and delay partition choice.
 5. Append record to accumulator:
    1. Get current sticky partition. 
    2. If we don't have load stats
@@ -908,12 +920,6 @@ in the accumulator by using built-in partitioner. The built-in partitioner makes
          - Diffs: [7 - 5 + 1, 7 - 1 + 1, 7 - 3 + 1] = [3, 7, 5]
          - Cumulative frequency: [3, 10, 15]
          - Random number is 4, so strictly greater cumulative frequency is 10 - thus it is partition 1.
-   4. Once we have a partition, look for a queue of batches to that partition. Take the last batch, and
-      if it's not full, append the record. Record the user provided callback and return a future. That callback will be then 
-      called when the record is sent. We'll get to that. 
-   5. If the batch is full (what does it mean to be full???), we have to create a new one, but to that we need to allocate memory. `KafkaProducer` limits total 
-      memory usage to `buffer.memory` property. If we exceed that, we'll block until some memory is freed. Once we have memory,
-      we create a new batch. 
    6. During the switch KafkaProducer informs the partitioner to pick the new partition. May exists edge cases when the 
       `linger.ms` passed, but the bytes sent < `batch.size`. In that case, we'll send the batch anyway, but don't immediately change 
       partition. Max 2x `batch.size` can be sent in that case.
@@ -925,7 +931,7 @@ in the accumulator by using built-in partitioner. The built-in partitioner makes
       The broker is ready if there is at least one partition that is not backing off its send (#TODO when can backoff) 
       and those partitions are not excluded from new messages sending, which is the case when 
       ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION == 1). 
-   4. Once we have candidate partition for sending we, one of the following must be true:
+   4. Once we have candidate partition for sending, one of the following must be true:
       1. The partition has full batch to be sent.
       2. The partition batch's linger time passed.
       3. KafkaProducer is out of memory so it tries to immediately send the batches (even uncompleted) to their partitions 
